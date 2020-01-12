@@ -358,7 +358,7 @@ class Future {
     template <typename Callback>
     auto goImpl(Executor &executor, Callback &&callback) {
         if constexpr (std::is_null_pointer<InputChain>::value) {
-            if constexpr (std::is_void<decltype(_callable())>::value) {
+            if constexpr (std::is_invocable_v<Callback>) {
                 _callable();
                 executor.schedule([this, &executor, callback]() mutable {
                     return callback();
@@ -431,23 +431,6 @@ class Future {
 template <class Callable>
 auto makeFuture(Callable &&callable) {
     return Future<Callable>(std::forward<Callable>(callable));
-}
-
-auto makeTestFutureChain2(Executor &executor) {
-    return makeFuture([]() { std::cout << "step 0" << std::endl; })
-        .then([&executor]() {
-            std::cout << "step 1" << std::endl;
-            return 2;
-        })
-        .then([](int &&i) {
-            //           std::cout << "step 2" << std::endl;
-            std::cout << "in a future with i : " << i << std::endl;
-            return std::string("something");
-        })
-        .then([](std::string &&s) {
-            //            std::cout << "step 3" << std::endl;
-            std::cout << "input s:  " << s << std::endl;
-        });
 }
 
 // auto voidThenValue(Executor &executor) {
