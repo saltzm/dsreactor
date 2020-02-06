@@ -1,6 +1,58 @@
 #include <iostream>
 #include <list>
 #include <type_traits>
+#include <variant>
+
+#include <netinet/in.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+
+// enum class ErrorCode { Error };
+//
+// template <typename T>
+// class ErrorOr {
+//   public:
+//    ErrorOr(T t) : _value(std::move(t)) {}
+//    ErrorOr(ErrorCode ec) : _value(ec) {}
+//
+//    T get() {
+//        // TODO throws
+//        return std::get<T>(_value);
+//    }
+//
+//    ErrorCode code() { return std::get<T>(_value); }
+//
+//    operator bool() { return std::holds_alternative<T>(_value); }
+//
+//   private:
+//    std::variant<ErrorCode, T> _value;
+//};
+//
+// class Socket {
+//   public:
+//    static ErrorOr<Socket> create() {
+//        int fd = socket(PF_INET, SOCK_STREAM, 0);
+//
+//        auto port = 4000;
+//        struct sockaddr_in* ipv4 = (struct sockaddr_in*)addr;
+//        ipv4->sin_family = AF_INET;
+//        ipv4->sin_addr.s_addr = htonl(INADDR_ANY);
+//        ipv4->sin_port = htons((uint16_t)port);
+//
+//        if (fd == -1) {
+//            return ErrorCode::Error;
+//        } else {
+//            return Socket(fd);
+//        }
+//    }
+//
+//   private:
+//    Socket(int fd) : _fd(fd) {}
+//
+//    int _fd;
+//};
 
 class Executor {
     using Callable = std::function<void()>;
@@ -46,6 +98,16 @@ class List {
             return std::move(_tail)
                 .append(std::move(end))
                 .prepend(std::move(_head));
+        }
+    }
+
+    template <typename L>
+    constexpr auto appendAll(L&& otherList) && {
+        if constexpr (std::is_null_pointer<Tail>::value) {
+            return std::move(otherList).prepend(std::move(_head));
+        } else {
+            return std::move(_tail).appendAll(otherList).prepend(
+                std::move(_head));
         }
     }
 
@@ -118,6 +180,11 @@ class List {
     Head _head;
     Tail _tail;
 };
+template <typename>
+struct IsList : public std::false_type {};
+
+template <typename... T>
+struct IsList<List<T...>> : public std::true_type {};
 
 template <typename CallableList, typename Input>
 auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
@@ -134,7 +201,11 @@ auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
         if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
             executor.schedule([list = std::forward<CallableList>(list),
                                &executor, x = std::move(x)]() mutable {
-                executeImpl(list.tail(), executor, std::move(x));
+                if constexpr (IsList<decltype(x)>::value) {
+                    executeImpl(std::move(x).appendAll(list.tail()), executor);
+                } else {
+                    executeImpl(list.tail(), executor, std::move(x));
+                }
             });
         }
     }
@@ -155,7 +226,11 @@ auto executeImpl(CallableList&& list, Executor& executor) {
         if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
             executor.schedule([list = std::forward<CallableList>(list),
                                &executor, x = std::move(x)]() mutable {
-                executeImpl(list.tail(), executor, std::move(x));
+                if constexpr (IsList<decltype(x)>::value) {
+                    executeImpl(std::move(x).appendAll(list.tail()), executor);
+                } else {
+                    executeImpl(list.tail(), executor, std::move(x));
+                }
             });
         }
     }
@@ -177,6 +252,21 @@ auto makeList(T&& t) {
 template <typename T>
 void print(const T& t) {
     std::cout << t << std::endl;
+}
+
+template <typename Do, typename While, typename Then>
+void loop(Executor& executor, Do&& fn, While&& condition, Then&& then) {
+    fn();
+    if (condition()) {
+        executor.schedule([&executor, fn = std::forward<Do>(fn),
+                           condition = std::forward<While>(condition),
+                           then = std::forward<Then>(then)] {
+            loop(executor, std::move(fn), std::move(condition),
+                 std::move(then));
+        });
+    } else {
+        then();
+    }
 }
 
 int main() {
@@ -209,6 +299,14 @@ int main() {
         [](auto currentSum, auto next) { return currentSum + next; });
     std::cout << "sum: " << sum << std::endl;
 
+    auto newListOfNumbersWithMoreNumbers =
+        std::move(listOfNumbers).appendAll(makeList(5).append(6).append(7));
+    std::cout << "newListOfNumbersWithMoreNumbers.size(): "
+              << newListOfNumbersWithMoreNumbers.size() << std::endl;
+    auto newSum = newListOfNumbersWithMoreNumbers.fold(
+        [](auto currentSum, auto next) { return currentSum + next; });
+    std::cout << "newSum: " << newSum << std::endl;
+
     std::cout << "\n\n";
 
     auto chain = makeList([] { return 3; })
@@ -225,68 +323,56 @@ int main() {
                      })
                      .append([] { return 10; });
 
-    // Compose all of the functions in the list so they run in order,
-    // supporting void-returning callables in the middle
-    //    auto composition = chain.fold([](auto current, auto next) {
-    //        return [current, next] {
-    //            if constexpr (std::is_invocable<decltype(next),
-    //                                            decltype(current())>::value) {
-    //                return next(current());
-    //            } else {
-    //                current();
-    //                return next();
-    //            }
-    //        };
-    //    });
-
-    //    auto result = composition();
-    //    std::cout << result << std::endl;
-
-    //    executor.schedule([executor]() {
-    //        // First thing in list
-    //        // auto res0 = head();
-    //        executor.schedule([executor, res0]() {
-    //            auto res1 = head(res0);
-    //            executor.schedule([...] {
-    //
-    //            });
-    //        });
-    //    });
+    auto nestedChain =
+        makeList([] { return 3; })
+            .append([](int i) {
+                std::cout << "Second in chain, i = " << i << std::endl;
+                return makeList([] { return 5; }).append([](int i) {
+                    return "in nested thingie";
+                });
+            })
+            .append([](std::string s) {
+                std::cout << s << std::endl;
+                std::cout << "Third in nested chain" << std::endl;
+                // TODO this should work w/ void return... works
+                // in wandbox return 3;
+            })
+            .append([] { return 10; });
 
     std::cout << "\n\n";
 
     Executor executor;
-    // Compose all of the functions in the list so they run in order,
-    // supporting void-returning callables in the middle
-    //    auto compositionOnExecutor =
-    //        chain.reverse().fold([&executor](auto current, auto next) {
-    //            return [&executor, current, next] {
-    //                // if constexpr
-    //                // (!std::is_void_v<std::decay_t<decltype(current())>>) {
-    //
-    //                if constexpr (std::is_invocable<decltype(current),
-    //                                                decltype(next())>::value)
-    //                                                {
-    //                    auto result = next();
-    //                    executor.schedule([current, input = std::move(result)]
-    //                    {
-    //                        current(input);
-    //                    });
-    //                    // return next(current());
-    //                } else {
-    //                    //                    current();
-    //                    //                    executor.schedule([next] {
-    //                    next(); });
-    //                }
-    //            };
-    //        });
-    //
-    //    compositionOnExecutor();
 
-    // chain.execute(executor);
-    for (auto i = 0; i < 10; ++i) {
-        execute(chain, executor);
-    }
+    executor.schedule([&executor] {
+        auto i = 3;
+        executor.schedule([i, &executor] {
+            std::cout << "X  Second in chain, i = " << i << std::endl;
+            auto s = std::string("i made it");
+
+            executor.schedule([s] {
+                std::cout << s << std::endl;
+                std::cout << "X Third in chain" << std::endl;
+                // TODO this should work w/ void return... works in
+                // wandbox
+                // return 3;
+            });
+        });
+    });
+
+    //    auto i = 0;
+    //    loop(executor,
+    //         [&i] {
+    //             std::cout << "looping" << std::endl;
+    //             ++i;
+    //         },
+    //         [&i] { return i < 5; }, [] { std::cout << "moving on" <<
+    //         std::endl; });
+    //
+    //    for (auto i = 0; i < 10; ++i) {
+    //        execute(chain, executor);
+    //    }
+
+    execute(nestedChain, executor);
 
     std::cout << "Starting executor" << std::endl;
     executor.run();
