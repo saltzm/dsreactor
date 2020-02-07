@@ -1,6 +1,10 @@
 #include <iostream>
 #include <list>
+#include <optional>
+#include <queue>
+#include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <variant>
 
 #include <netinet/in.h>
@@ -180,12 +184,125 @@ class List {
     Head _head;
     Tail _tail;
 };
+
+template <typename T>
+class Future {
+   public:
+    //    Future() = default;
+    //    Future(const Future&) = delete;
+    //
+    //    Future(Future&& other) noexcept { *this = std::move(other); }
+    //
+    //    Future& operator=(Future&& source) noexcept {
+    //        _value = std::move(source._value);
+    //        _continuation = std::move(source._continuation);
+    //        return *this;
+    //    }
+    void set(T t) {
+        if (_state->_continuation) {
+            // std::cout << "Calling continuation" << std::endl;
+            auto fn = *(_state->_continuation);
+            // std::cout << "Really calling continuation" << std::endl;
+            fn(t);
+            // std::cout << "Called continuation" << std::endl;
+        } else {
+            // std::cout << "set value" << std::endl;
+            _state->_value.emplace(std::move(t));
+        }
+    }
+
+    template <typename Callable>
+    auto then(Callable callable) {
+        if (_state->_value) {
+            callable(*(_state->_value));
+        } else {
+            // std::cout << ".then" << std::endl;
+            _state->_continuation.emplace(std::move(callable));
+        }
+    }
+
+   private:
+    struct State {
+        std::optional<T> _value;
+        std::optional<std::function<void(T)>> _continuation;
+    };
+    std::shared_ptr<State> _state{std::make_shared<State>()};
+};
+
+template <typename T>
+class Promise {
+   public:
+    //    Future() = default;
+    //    Future(const Future&) = delete;
+    //
+    //    Future(Future&& other) noexcept { *this = std::move(other); }
+    //
+    //    Future& operator=(Future&& source) noexcept {
+    //        _value = std::move(source._value);
+    //        _continuation = std::move(source._continuation);
+    //        return *this;
+    //    }
+
+    void set(T t) {
+        std::cout << "promise set" << std::endl;
+        _future.set(t);
+        std::cout << "after promise set" << std::endl;
+        //        if (_continuation) {
+        //            std::cout << "Calling continuation" << std::endl;
+        //            auto fn = *_continuation;
+        //            std::cout << "Really calling continuation" << std::endl;
+        //            fn(t);
+        //            std::cout << "Called continuation" << std::endl;
+        //        } else {
+        //            _value = std::make_shared<T>(std::move(t));
+        //        }
+    }
+
+    Future<T> getFuture() { return _future; }
+
+   private:
+    Future<T> _future;
+    //    std::shared_ptr<std::function<void(T)>> _continuation{nullptr};
+};
+
+// template <typename T>
+// class Future {
+//   public:
+//    void set(T t) {
+//        if (_continuation) {
+//            (*_continuation)(t);
+//        } else {
+//            _value = std::move(t);
+//        }
+//    }
+//
+//    template <typename Callable>
+//    auto then(Callable&& callable) {
+//        if (_value) {
+//            callable(*_value);
+//        } else {
+//            _continuation.emplace(std::move(callable));
+//        }
+//    }
+//
+//   private:
+//    std::optional<T> _value;
+//    std::optional<std::function<void(T)>> _continuation;
+//};
+
 template <typename>
 struct IsList : public std::false_type {};
 
 template <typename... T>
 struct IsList<List<T...>> : public std::true_type {};
 
+template <typename>
+struct IsFuture : public std::false_type {};
+
+template <typename T>
+struct IsFuture<Future<T>> : public std::true_type {};
+
+// TODO make all these cool and move-y and non leaky
 template <typename CallableList, typename Input>
 auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
     if constexpr (std::is_void<decltype(list.head()(input))>::value) {
@@ -203,6 +320,13 @@ auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
                                &executor, x = std::move(x)]() mutable {
                 if constexpr (IsList<decltype(x)>::value) {
                     executeImpl(std::move(x).appendAll(list.tail()), executor);
+                } else if constexpr (IsFuture<decltype(x)>::value) {
+                    // std::cout << "XXX chaining continuation" << std::endl;
+                    x.then([list = std::forward<CallableList>(list),
+                            &executor](auto val) mutable {
+                        // std::cout << "XXXXXXXXX 1" << std::endl;
+                        executeImpl(list.tail(), executor, std::move(val));
+                    });
                 } else {
                     executeImpl(list.tail(), executor, std::move(x));
                 }
@@ -228,6 +352,13 @@ auto executeImpl(CallableList&& list, Executor& executor) {
                                &executor, x = std::move(x)]() mutable {
                 if constexpr (IsList<decltype(x)>::value) {
                     executeImpl(std::move(x).appendAll(list.tail()), executor);
+                } else if constexpr (IsFuture<decltype(x)>::value) {
+                    std::cout << "XXX chaining continuation 000" << std::endl;
+                    x.then([list = std::forward<CallableList>(list),
+                            &executor](auto val) mutable {
+                        std::cout << "XXXXXXXXX 0" << std::endl;
+                        executeImpl(list.tail(), executor, std::move(val));
+                    });
                 } else {
                     executeImpl(list.tail(), executor, std::move(x));
                 }
@@ -243,6 +374,44 @@ auto execute(CallableList&& list, Executor& executor) {
             executeImpl(std::move(list), executor);
         });
 }
+
+// template <typename T>
+// class ReadyFuture {
+//   public:
+//    ReadyFuture(T t) : _t(std::move(t)) {}
+//
+//    template <typename Callable>
+//    auto then(Callable&& callable) {
+//        callable(_t);
+//    }
+//
+//   private:
+//    T _t;
+//};
+//
+// template <typename T, typename Callable>
+// class FutureWithContinuation {
+//   public:
+//    FutureWithContinuation(Callable continuation)
+//        : _continuation(std::move(continuation)) {}
+//
+//    void set(T t) { _continuation(t); }
+//
+//   private:
+//    Callable _continuation;
+//};
+//
+// template <typename T>
+// class Future {
+//   public:
+//    void set(T t) { return ReadyFuture<T>(std::move(t)); }
+//
+//    template <typename Callable>
+//    auto then(Callable&& callable) {
+//        return FutureWithContinuation<T, Callable>(
+//            std::forward<Callable>(callable));
+//    }
+//};
 
 template <typename T>
 auto makeList(T&& t) {
@@ -269,7 +438,119 @@ void loop(Executor& executor, Do&& fn, While&& condition, Then&& then) {
     }
 }
 
+template <typename Do>
+void loop(Executor& executor, Do&& fn) {
+    bool shouldContinue = fn();
+    if (shouldContinue) {
+        executor.schedule([&executor, fn = std::forward<Do>(fn)]() mutable {
+            loop(executor, std::move(fn));
+        });
+    }
+}
+
+// static std::thread keyboardInputThread;
+//
+//
+
+static std::optional<std::string> userInput;
+static std::queue<std::string> userInputQueue;
+
+class UserInputSubscriptionService {
+   public:
+    UserInputSubscriptionService(Executor& e) : _executor(e) {}
+    ~UserInputSubscriptionService() { _monitoringThread.join(); }
+
+    Future<std::string> subscribe(std::string filter) {
+        Promise<std::string> p;
+        auto f = p.getFuture();
+        _subscribers.emplace(filter, std::move(p));
+        return f;
+    }
+
+    void run() {
+        _monitoringThread = std::thread([] {
+            std::cout << "Inside thread " << std::endl;
+            while (true) {
+                std::string input;
+                std::cin >> input;
+                std::cout << "Inside thread: got input " << std::endl;
+                userInputQueue.push(input);
+            }
+        });
+
+        loop(_executor, [this]() mutable {
+            // std::cout << "looping" << std::endl;
+            if (userInputQueue.size() > 0) {
+                auto next = userInputQueue.front();
+                userInputQueue.pop();
+                std::vector<std::string> filtersToRemove;
+                for (auto& [k, v] : _subscribers) {
+                    if (next.find(k) != std::string::npos) {
+                        v.set(next);
+                        filtersToRemove.push_back(k);
+                    }
+                }
+                for (auto& filter : filtersToRemove) {
+                    _subscribers.erase(filter);
+                }
+            }
+            return true;
+        });
+    }
+
+   private:
+    Executor& _executor;
+    std::unordered_map<std::string, Promise<std::string>> _subscribers;
+    std::thread _monitoringThread;
+};
+
+void getKeyboardInputAsync() {
+    std::thread t([] {
+        std::cout << "Inside thread " << std::endl;
+        while (true) {
+            std::string input;
+            std::cin >> input;
+            std::cout << "Inside thread: got input " << std::endl;
+            userInputQueue.push(input);
+        }
+    });
+    t.detach();
+}
+
+Future<std::string> getKeyboardInput(Executor& e) {
+    Promise<std::string> p;
+    Future<std::string> f = p.getFuture();
+    loop(e, [p]() mutable {
+        // std::cout << "looping" << std::endl;
+        if (userInput) {
+            p.set(*userInput);
+            return false;
+        }
+        return true;
+    });
+    return f;
+}
+
 int main() {
+    // getKeyboardInputAsync();
+    //    auto keyboardInput = getKeyboardInput();
+    //    keyboardInput.then([](std::string input) {
+    //        std::cout << "got input! " << input << std::endl;
+    //    });
+
+    //    ReadyFuture<int> f(3);
+    //    f.then(
+    //        [](int i) { std::cout << "Did something with i: " << i <<
+    //        std::endl; });
+    //
+    //    auto futWithCont = Future<int>().then(
+    //        [](int i) { std::cout << "Did something with i: " << i <<
+    //        std::endl; });
+    //
+    //    futWithCont.set(5);
+
+    // futWith
+
     List l(3);
     auto fullList = makeList(3).prepend("hi").prepend(4.2);
     std::cout << "fullList.size(): " << fullList.size() << std::endl;
@@ -309,14 +590,22 @@ int main() {
 
     std::cout << "\n\n";
 
+    Executor executor;
+    UserInputSubscriptionService inputService(executor);
+    inputService.run();
+
     auto chain = makeList([] { return 3; })
-                     .append([](int i) {
+                     .append([&](int i) {
                          std::cout << "Second in chain, i = " << i << std::endl;
-                         return std::string("i made it");
+                         return inputService.subscribe("foo");
+                     })
+                     .append([&](std::string s) {
+                         std::cout << "Saw input: " << s << std::endl;
+                         return inputService.subscribe("bar");
                      })
                      .append([](std::string s) {
-                         std::cout << s << std::endl;
                          std::cout << "Third in chain" << std::endl;
+                         std::cout << s << std::endl;
                          // TODO this should work w/ void return... works in
                          // wandbox
                          // return 3;
@@ -325,10 +614,15 @@ int main() {
 
     auto nestedChain =
         makeList([] { return 3; })
-            .append([](int i) {
+            .append([&](int i) {
                 std::cout << "Second in chain, i = " << i << std::endl;
-                return makeList([] { return 5; }).append([](int i) {
-                    return "in nested thingie";
+                return makeList([&] { return 5; }).append([&](int i) {
+                    std::cout << "in nested thingie" << std::endl;
+                    return makeList([] { return 10.0; }).append([&](float x) {
+                        std::cout << "in double nested thingie: x = " << x
+                                  << std::endl;
+                        return inputService.subscribe("hello");
+                    });
                 });
             })
             .append([](std::string s) {
@@ -341,40 +635,49 @@ int main() {
 
     std::cout << "\n\n";
 
-    Executor executor;
-
-    executor.schedule([&executor] {
-        auto i = 3;
-        executor.schedule([i, &executor] {
-            std::cout << "X  Second in chain, i = " << i << std::endl;
-            auto s = std::string("i made it");
-
-            executor.schedule([s] {
-                std::cout << s << std::endl;
-                std::cout << "X Third in chain" << std::endl;
-                // TODO this should work w/ void return... works in
-                // wandbox
-                // return 3;
-            });
-        });
-    });
+    //    executor.schedule([&executor] {
+    //        auto i = 3;
+    //        executor.schedule([i, &executor] {
+    //            std::cout << "X  Second in chain, i = " << i << std::endl;
+    //            auto s = std::string("i made it");
+    //
+    //            executor.schedule([s] {
+    //                std::cout << s << std::endl;
+    //                std::cout << "X Third in chain" << std::endl;
+    //                // TODO this should work w/ void return... works in
+    //                // wandbox
+    //                // return 3;
+    //            });
+    //        });
+    //    });
 
     //    auto i = 0;
-    //    loop(executor,
-    //         [&i] {
-    //             std::cout << "looping" << std::endl;
-    //             ++i;
-    //         },
-    //         [&i] { return i < 5; }, [] { std::cout << "moving on" <<
-    //         std::endl; });
+    // loop(executor,
+    //     [&i] {
+    //         std::cout << "looping" << std::endl;
+    //         ++i;
+    //     },
+    //     [&i] { return i < 5; }, [] { std::cout << "moving on" << std::endl;
+    //     });
     //
-    //    for (auto i = 0; i < 10; ++i) {
-    //        execute(chain, executor);
-    //    }
+    // for (auto i = 0; i < 10; ++i) {
+    //    execute(chain, executor);
+    //}
 
+    //    for (auto i = 0; i < 10; ++i) {
+    //
+    execute(chain, executor);
     execute(nestedChain, executor);
+
+    //   }
+    //    auto i = 0;
+    //
 
     std::cout << "Starting executor" << std::endl;
     executor.run();
+    //    while (true) {
+    //    }
+    // sleep(10000);
+    // keyboardInputThread.join();
     // std::cout << result << std::endl;
 }
