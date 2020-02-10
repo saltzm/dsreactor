@@ -7,11 +7,17 @@
 #include <unordered_map>
 #include <variant>
 
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/event.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+
+#include <netdb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 // enum class ErrorCode { Error };
 //
@@ -238,7 +244,8 @@ struct IsFuture<Future<T>> : public std::true_type {};
 
 // TODO make all these cool and move-y and non leaky
 template <typename CallableList, typename Input>
-auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
+constexpr auto executeImpl(CallableList&& list, Executor& executor,
+                           Input&& input) {
     if constexpr (std::is_void<decltype(list.head()(input))>::value) {
         list.head()(input);
         if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
@@ -270,7 +277,7 @@ auto executeImpl(CallableList&& list, Executor& executor, Input&& input) {
 }
 
 template <typename CallableList>
-auto executeImpl(CallableList&& list, Executor& executor) {
+constexpr auto executeImpl(CallableList&& list, Executor& executor) {
     if constexpr (std::is_void<decltype(list.head()())>::value) {
         list.head()();
         if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
@@ -304,7 +311,7 @@ auto executeImpl(CallableList&& list, Executor& executor) {
 }
 
 template <typename CallableList>
-auto execute(CallableList&& list, Executor& executor) {
+constexpr auto execute(CallableList&& list, Executor& executor) {
     executor.schedule(
         [list = std::forward<CallableList>(list), &executor]() mutable {
             executeImpl(std::move(list), executor);
@@ -337,7 +344,7 @@ void loop(Executor& executor, Do&& fn, While&& condition, Then&& then) {
 }
 
 template <typename Do>
-void loop(Executor& executor, Do&& fn) {
+constexpr void loop(Executor& executor, Do&& fn) {
     bool shouldContinue = fn();
     if (shouldContinue) {
         executor.schedule([&executor, fn = std::forward<Do>(fn)]() mutable {
@@ -346,12 +353,67 @@ void loop(Executor& executor, Do&& fn) {
     }
 }
 
+static std::queue<std::string> userInputQueue;
 // static std::thread keyboardInputThread;
 //
 //
 
 static std::optional<std::string> userInput;
-static std::queue<std::string> userInputQueue;
+
+void diep(const char* s) {
+    perror(s);
+    exit(EXIT_FAILURE);
+}
+
+int tcpopen(const char* host, int port) {
+    struct sockaddr_in server;
+    struct hostent* hp;
+    int sckfd;
+
+    if ((hp = gethostbyname(host)) == NULL) diep("gethostbyname()");
+
+    if ((sckfd = socket(PF_INET, SOCK_STREAM, 0)) < 0) diep("socket()");
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+    server.sin_addr = *((struct in_addr*)hp->h_addr);
+    memset(&(server.sin_zero), 0, 8);
+
+    if (connect(sckfd, (struct sockaddr*)&server, sizeof(struct sockaddr)) < 0)
+        diep("connect()");
+
+    // assert(listen(sckfd, 5) != -1);
+    // struct sockaddr_in6 addr = {};
+    // addr.sin6_len = sizeof(addr);
+    // addr.sin6_family = AF_INET6;
+    // addr.sin6_addr = in6addr_any;  //(struct in6_addr){}; // 0.0.0.0 / ::
+    // addr.sin6_port = htons(9999);
+
+    // int localFd = socket(addr.sin6_family, SOCK_STREAM, 0);
+    // assert(localFd != -1);
+
+    // int on = 1;
+    // setsockopt(localFd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    // if (bind(localFd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+    //    perror("bind");
+    //    return 1;
+    //}
+    // assert(listen(localFd, 5) != -1);
+    std::cout << "sckfd: " << sckfd << std::endl;
+
+    return sckfd;
+}
+
+void sendbuftosck(int sckfd, const char* buf, int len) {
+    int bytessent, pos;
+
+    pos = 0;
+    do {
+        if ((bytessent = send(sckfd, buf + pos, len - pos, 0)) < 0)
+            diep("send()");
+        pos += bytessent;
+    } while (bytessent > 0);
+}
 
 class UserInputSubscriptionService {
    public:
@@ -376,26 +438,26 @@ class UserInputSubscriptionService {
 
     void run() {
         _monitoringThread = std::thread([this] {
-            // std::cout << "Inside thread " << std::endl;
             while (!_shutdown) {
                 std::string input;
                 std::cin >> input;
-                // std::cout << "Inside thread: got input " << std::endl;
-                userInputQueue.push(input);
+                std::lock_guard lk(_mutex);
+                _userInputQueue.push(input);
             }
         });
 
         loop(_executor, [this]() mutable {
-            // std::cout << "looping" << std::endl;
-            if (userInputQueue.size() > 0) {
-                auto next = userInputQueue.front();
+            std::unique_lock lk(_mutex);
+            if (_userInputQueue.size() > 0) {
+                auto next = _userInputQueue.front();
+                lk.unlock();
                 if (next == "die") {
                     _shutdown = true;
                     _monitoringThread.join();
                     return false;
                 }
 
-                userInputQueue.pop();
+                _userInputQueue.pop();
                 std::vector<std::string> filtersToRemove;
                 for (auto& [k, v] : _subscribers) {
                     if (next.find(k) != std::string::npos) {
@@ -419,8 +481,104 @@ class UserInputSubscriptionService {
     bool _shutdown{false};
     std::unordered_map<std::string, std::vector<Promise<std::string>>>
         _subscribers;
+
     std::thread _monitoringThread;
+
+    // Protects input queue
+    std::mutex _mutex;
+    std::queue<std::string> _userInputQueue;
 };
+
+class KernelEventListener {
+   public:
+    KernelEventListener(Executor& e) : _executor(e), _kernelQueue(kqueue()) {
+        assert(_kernelQueue != -1);
+    }
+    ~KernelEventListener() {
+        /* Close kqueue */
+        if (close(_kernelQueue) == -1) diep("close()");
+    }
+
+    enum class EventType : int {
+        kRead = EVFILT_READ,
+        kWrite = EVFILT_WRITE,
+    };
+
+    Future<struct kevent> subscribe(int fd, EventType type) {
+        _eventsToMonitor.emplace_back();
+        _monitoredEventPromises.emplace_back();
+        _eventsReceived.emplace_back();
+        EV_SET(&_eventsToMonitor.back(), fd, int(type), EV_ADD | EV_ENABLE, 0,
+               0, 0);
+        return _monitoredEventPromises.back().getFuture();
+    }
+
+    void run() {
+        // Just poll - never block.
+        struct timespec timeout = {0, 0};
+        loop(_executor, [this, timeout]() mutable {
+            // std::cout << "LOOP: " << _eventsToMonitor.size() << std::endl;
+
+            if (_eventsToMonitor.size() > 0) {
+                // std::cout << "about to block on kevent" << std::endl;
+
+                int nev =
+                    kevent(_kernelQueue, _eventsToMonitor.data(),
+                           _eventsToMonitor.size(), _eventsReceived.data(),
+                           _eventsReceived.size(), &timeout);
+
+                // std::cout << "done blocking on kevent" << std::endl;
+
+                if (nev < 0) {
+                    diep("kevent()");
+                } else if (nev > 0) {
+                    for (auto i = 0; i < nev; i++) {
+                        if (_eventsReceived[i].flags & EV_EOF ||
+                            _eventsReceived[i].flags & EV_ERROR) {
+                            /* Report errors */
+                            fprintf(stderr, "EV_ERROR: %s\n",
+                                    strerror(_eventsReceived[i].data));
+                            exit(EXIT_FAILURE);
+                        }
+
+                        _monitoredEventPromises[i].set(_eventsReceived[i]);
+                    }
+                }
+            }
+            return true;
+        });
+    }
+
+   private:
+    Executor& _executor;
+
+    int _kernelQueue;
+
+    std::vector<struct kevent> _eventsToMonitor;
+    std::vector<Promise<struct kevent>> _monitoredEventPromises;
+    std::vector<struct kevent> _eventsReceived;
+};
+
+void doNetworkStuff(KernelEventListener& listener) {
+    // auto sockfd = tcpopen("0.0.0.0", 8000);
+    auto sockfd = fileno(stdin);
+
+    auto dataReady =
+        listener.subscribe(sockfd, KernelEventListener::EventType::kRead);
+
+    dataReady.then([sockfd](struct kevent kev) {
+        std::cout << "CLLABCK" << std::endl;
+        const int kBufSize = 1024;
+        char buf[kBufSize];
+
+        /* We have data from the host */
+        memset(buf, 0, kBufSize);
+        //        if (read(sockfd, buf, kBufSize) < 0) diep("read()");
+        fgets(buf, kBufSize, stdin);
+        std::cout << std::string(buf, kBufSize) << std::endl;
+        // fputs(buf, stdout);
+    });
+}
 
 void getKeyboardInputAsync() {
     std::thread t([] {
@@ -469,120 +627,126 @@ int main() {
 
     // futWith
 
-    List l(3);
-    auto fullList = makeList(3).prepend("hi").prepend(4.2);
-    std::cout << "fullList.size(): " << fullList.size() << std::endl;
+    // List l(3);
+    // auto fullList = makeList(3).prepend("hi").prepend(4.2);
+    // std::cout << "fullList.size(): " << fullList.size() << std::endl;
 
-    fullList.forEach([](auto& x) { std::cout << x << std::endl; });
+    // fullList.forEach([](auto& x) { std::cout << x << std::endl; });
 
-    std::cout << "\n\n";
+    // std::cout << "\n\n";
 
-    auto newList = makeList(4).append("hi").append(42);
+    // auto newList = makeList(4).append("hi").append(42);
 
-    newList.forEach([](auto& x) { std::cout << x << std::endl; });
+    // newList.forEach([](auto& x) { std::cout << x << std::endl; });
 
-    std::cout << "\n\n";
+    // std::cout << "\n\n";
 
-    auto listOfCallables =
-        makeList([] { std::cout << "First!" << std::endl; })
-            .append([] { std::cout << "Second!" << std::endl; })
-            .append([] { std::cout << "Third!" << std::endl; });
+    // auto listOfCallables =
+    //    makeList([] { std::cout << "First!" << std::endl; })
+    //        .append([] { std::cout << "Second!" << std::endl; })
+    //        .append([] { std::cout << "Third!" << std::endl; });
 
-    listOfCallables.forEach([](auto& callable) { callable(); });
-    listOfCallables.reverse().forEach([](auto& callable) { callable(); });
+    // listOfCallables.forEach([](auto& callable) { callable(); });
+    // listOfCallables.reverse().forEach([](auto& callable) { callable(); });
 
-    std::cout << "\n\n";
+    // std::cout << "\n\n";
 
-    auto listOfNumbers = makeList(3).append(4.2).append(20ull);
-    auto sum = listOfNumbers.fold(
-        [](auto currentSum, auto next) { return currentSum + next; });
-    std::cout << "sum: " << sum << std::endl;
+    // auto listOfNumbers = makeList(3).append(4.2).append(20ull);
+    // auto sum = listOfNumbers.fold(
+    //    [](auto currentSum, auto next) { return currentSum + next; });
+    // std::cout << "sum: " << sum << std::endl;
 
-    auto newListOfNumbersWithMoreNumbers =
-        std::move(listOfNumbers).appendAll(makeList(5).append(6).append(7));
-    std::cout << "newListOfNumbersWithMoreNumbers.size(): "
-              << newListOfNumbersWithMoreNumbers.size() << std::endl;
-    auto newSum = newListOfNumbersWithMoreNumbers.fold(
-        [](auto currentSum, auto next) { return currentSum + next; });
-    std::cout << "newSum: " << newSum << std::endl;
+    // auto newListOfNumbersWithMoreNumbers =
+    //    std::move(listOfNumbers).appendAll(makeList(5).append(6).append(7));
+    // std::cout << "newListOfNumbersWithMoreNumbers.size(): "
+    //          << newListOfNumbersWithMoreNumbers.size() << std::endl;
+    // auto newSum = newListOfNumbersWithMoreNumbers.fold(
+    //    [](auto currentSum, auto next) { return currentSum + next; });
+    // std::cout << "newSum: " << newSum << std::endl;
 
-    std::cout << "\n\n";
+    // std::cout << "\n\n";
 
     Executor executor;
-    UserInputSubscriptionService inputService(executor);
-    inputService.run();
+    //    UserInputSubscriptionService inputService(executor);
+    //    inputService.run();
+    KernelEventListener keventListener(executor);
+    keventListener.run();
+    doNetworkStuff(keventListener);
 
-    auto chain =
-        makeList([&] {
-            std::cout << "Process: Waiting to hear foo... " << std::endl;
-            return inputService.subscribe("foo");
-        })
-            .append([&](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
-                std::cout << "Process: Waiting to hear bar...: " << std::endl;
-                return inputService.subscribe("bar");
-            })
-            .append([](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
-            });
-
-    auto nestedChain =
-        makeList([] { return 3; })
-            .append([&](int i) {
-                std::cout << "Second in chain, i = " << i << std::endl;
-                return makeList([&] { return 5; }).append([&](int i) {
-                    std::cout << "in nested thingie" << std::endl;
-                    return makeList([] { return 10.0; }).append([&](float x) {
-                        std::cout << "in double nested thingie: x = " << x
-                                  << std::endl;
-                        return inputService.subscribe("hello");
-                    });
-                });
-            })
-            .append([](std::string s) {
-                std::cout << s << std::endl;
-                std::cout << "Third in nested chain" << std::endl;
-                // TODO this should work w/ void return... works
-                // in wandbox return 3;
-            })
-            .append([] { return 10; });
-
-    std::cout << "\n\n";
-
-    //    executor.schedule([&executor] {
-    //        auto i = 3;
-    //        executor.schedule([i, &executor] {
-    //            std::cout << "X  Second in chain, i = " << i << std::endl;
-    //            auto s = std::string("i made it");
-    //
-    //            executor.schedule([s] {
-    //                std::cout << s << std::endl;
-    //                std::cout << "X Third in chain" << std::endl;
-    //                // TODO this should work w/ void return... works in
-    //                // wandbox
-    //                // return 3;
+    //    auto chain =
+    //        makeList([&] {
+    //            std::cout << "Process: Waiting to hear foo... " << std::endl;
+    //            return inputService.subscribe("foo");
+    //        })
+    //            .append([&](std::string s) {
+    //                std::cout << "Process: Saw input: " << s << std::endl;
+    //                std::cout << "Process: Waiting to hear bar...: " <<
+    //                std::endl; return inputService.subscribe("bar");
+    //            })
+    //            .append([](std::string s) {
+    //                std::cout << "Process: Saw input: " << s << std::endl;
     //            });
-    //        });
-    //    });
 
-    //    auto i = 0;
-    // loop(executor,
-    //     [&i] {
-    //         std::cout << "looping" << std::endl;
-    //         ++i;
-    //     },
-    //     [&i] { return i < 5; }, [] { std::cout << "moving on" << std::endl;
-    //     });
+    //    auto nestedChain =
+    //        makeList([] { return 3; })
+    //            .append([&](int i) {
+    //                std::cout << "Second in chain, i = " << i << std::endl;
+    //                return makeList([&] { return 5; }).append([&](int i) {
+    //                    std::cout << "in nested thingie" << std::endl;
+    //                    return makeList([] { return 10.0; }).append([&](float
+    //                    x) {
+    //                        std::cout << "in double nested thingie: x = " << x
+    //                                  << std::endl;
+    //                        return inputService.subscribe("hello");
+    //                    });
+    //                });
+    //            })
+    //            .append([](std::string s) {
+    //                std::cout << s << std::endl;
+    //                std::cout << "Third in nested chain" << std::endl;
+    //                // TODO this should work w/ void return... works
+    //                // in wandbox return 3;
+    //            })
+    //            .append([] { return 10; });
     //
-    // for (auto i = 0; i < 10; ++i) {
-    //    execute(chain, executor);
-    //}
-
-    for (auto i = 0; i < 10; ++i) {
-        //
-        execute(chain, executor);
-        // execute(nestedChain, executor);
-    }
+    //    std::cout << "\n\n";
+    //
+    //    //    executor.schedule([&executor] {
+    //    //        auto i = 3;
+    //    //        executor.schedule([i, &executor] {
+    //    //            std::cout << "X  Second in chain, i = " << i <<
+    //    std::endl;
+    //    //            auto s = std::string("i made it");
+    //    //
+    //    //            executor.schedule([s] {
+    //    //                std::cout << s << std::endl;
+    //    //                std::cout << "X Third in chain" << std::endl;
+    //    //                // TODO this should work w/ void return... works in
+    //    //                // wandbox
+    //    //                // return 3;
+    //    //            });
+    //    //        });
+    //    //    });
+    //
+    //    //    auto i = 0;
+    //    // loop(executor,
+    //    //     [&i] {
+    //    //         std::cout << "looping" << std::endl;
+    //    //         ++i;
+    //    //     },
+    //    //     [&i] { return i < 5; }, [] { std::cout << "moving on" <<
+    //    std::endl;
+    //    //     });
+    //    //
+    //    // for (auto i = 0; i < 10; ++i) {
+    //    //    execute(chain, executor);
+    //    //}
+    //
+    //    for (auto i = 0; i < 10; ++i) {
+    //        //
+    // execute(chain, executor);
+    //        // execute(nestedChain, executor);
+    //    }
     //    auto i = 0;
     //
 
