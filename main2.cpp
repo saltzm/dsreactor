@@ -68,6 +68,9 @@ class Executor {
     using Callable = std::function<void()>;
 
    public:
+    ~Executor() {
+        std::cout << "_tasksExecuted: " << _tasksExecuted << std::endl;
+    }
     void schedule(Callable&& callable) {
         queue.emplace_back(std::move(callable));
     }
@@ -80,10 +83,12 @@ class Executor {
             } catch (...) {
             }
             queue.pop_front();
+            ++_tasksExecuted;
         }
     }
 
    private:
+    long long _tasksExecuted{0};
     std::list<Callable> queue;
 };
 
