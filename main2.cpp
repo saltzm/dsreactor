@@ -204,7 +204,7 @@ class Future {
     }
 
     template <typename Callable>
-    auto then(Callable callable) {
+    auto then(Callable&& callable) {
         if (_state->_value) {
             callable(*(_state->_value));
         } else {
@@ -294,12 +294,8 @@ constexpr auto executeImpl(CallableList&& list, Executor& executor) {
                 if constexpr (IsList<decltype(x)>::value) {
                     executeImpl(std::move(x).appendAll(list.tail()), executor);
                 } else if constexpr (IsFuture<decltype(x)>::value) {
-                    //           std::cout << "XXX chaining continuation 000" <<
-                    //           std::endl;
                     x.then([list = std::forward<CallableList>(list),
                             &executor](auto val) mutable {
-                        //               std::cout << "XXXXXXXXX 0" <<
-                        //               std::endl;
                         executeImpl(list.tail(), executor, std::move(val));
                     });
                 } else {
@@ -399,6 +395,43 @@ int tcpopen(const char* host, int port) {
     //    return 1;
     //}
     // assert(listen(localFd, 5) != -1);
+    std::cout << "sckfd: " << sckfd << std::endl;
+
+    return sckfd;
+}
+
+int tcpbind(const char* host, int port) {
+    struct sockaddr_in server;
+    struct hostent* hp;
+    int sckfd;
+
+    if ((hp = gethostbyname(host)) == NULL) diep("gethostbyname()");
+
+    if ((sckfd = socket(PF_INET, SOCK_STREAM, 0)) < 0) diep("socket()");
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+    server.sin_addr = *((struct in_addr*)hp->h_addr);
+    memset(&(server.sin_zero), 0, 8);
+
+    // assert(listen(sckfd, 5) != -1);
+    // struct sockaddr_in6 addr = {};
+    // addr.sin6_len = sizeof(addr);
+    // addr.sin6_family = AF_INET6;
+    // addr.sin6_addr = in6addr_any;  //(struct in6_addr){}; // 0.0.0.0 / ::
+    // addr.sin6_port = htons(9999);
+
+    // int localFd = socket(addr.sin6_family, SOCK_STREAM, 0);
+    // assert(localFd != -1);
+
+    int on = 1;
+    setsockopt(sckfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    if (bind(sckfd, (struct sockaddr*)&server, sizeof(server)) == -1) {
+        perror("bind");
+        return 1;
+    }
+    assert(listen(sckfd, 5) != -1);
+
     std::cout << "sckfd: " << sckfd << std::endl;
 
     return sckfd;
@@ -506,11 +539,11 @@ class KernelEventListener {
 
     Future<struct kevent> subscribe(int fd, EventType type) {
         _eventsToMonitor.emplace_back();
-        _monitoredEventPromises.emplace_back();
+        _monitoredEventPromises[fd];
         _eventsReceived.emplace_back();
         EV_SET(&_eventsToMonitor.back(), fd, int(type), EV_ADD | EV_ENABLE, 0,
                0, 0);
-        return _monitoredEventPromises.back().getFuture();
+        return _monitoredEventPromises[fd].getFuture();
     }
 
     void run() {
@@ -540,8 +573,12 @@ class KernelEventListener {
                                     strerror(_eventsReceived[i].data));
                             exit(EXIT_FAILURE);
                         }
+                        std::cout << "_monitoredEventPromises.size(): "
+                                  << _monitoredEventPromises.size()
+                                  << std::endl;
 
-                        _monitoredEventPromises[i].set(_eventsReceived[i]);
+                        _monitoredEventPromises[_eventsReceived[i].ident].set(
+                            _eventsReceived[i]);
                     }
                 }
             }
@@ -555,29 +592,71 @@ class KernelEventListener {
     int _kernelQueue;
 
     std::vector<struct kevent> _eventsToMonitor;
-    std::vector<Promise<struct kevent>> _monitoredEventPromises;
+    std::unordered_map<int, Promise<struct kevent>> _monitoredEventPromises;
     std::vector<struct kevent> _eventsReceived;
 };
 
-void doNetworkStuff(KernelEventListener& listener) {
-    // auto sockfd = tcpopen("0.0.0.0", 8000);
-    auto sockfd = fileno(stdin);
+void runServer(KernelEventListener& listener) {
+    auto sockfd = tcpbind("0.0.0.0", 8000);
 
-    auto dataReady =
-        listener.subscribe(sockfd, KernelEventListener::EventType::kRead);
+    listener.subscribe(sockfd, KernelEventListener::EventType::kRead)
+        .then([&listener, sockfd](struct kevent kev) {
+            std::cout << "Received new connection!" << std::endl;
 
-    dataReady.then([sockfd](struct kevent kev) {
-        std::cout << "CLLABCK" << std::endl;
-        const int kBufSize = 1024;
-        char buf[kBufSize];
+            struct sockaddr_in cliaddr;
+            socklen_t cliaddrlen = sizeof(cliaddr);
 
-        /* We have data from the host */
-        memset(buf, 0, kBufSize);
-        //        if (read(sockfd, buf, kBufSize) < 0) diep("read()");
-        fgets(buf, kBufSize, stdin);
-        std::cout << std::string(buf, kBufSize) << std::endl;
-        // fputs(buf, stdout);
-    });
+            int connfd =
+                accept(sockfd, (struct sockaddr*)&cliaddr, &cliaddrlen);
+
+            std::cout << "Connection accepted!" << std::endl;
+
+            listener.subscribe(connfd, KernelEventListener::EventType::kRead)
+                .then([connfd](struct kevent kev) {
+                    const int kBufSize = 1024;
+                    char buf[kBufSize];
+
+                    // Read data from the client.
+                    memset(buf, 0, kBufSize);
+                    if (read(connfd, buf, kBufSize) < 0) diep("read()");
+                    // Echo it back.
+                    // TODO make also async
+                    if (write(connfd, buf, kBufSize) < 0) diep("write()");
+
+                    std::cout << "Client said: " << std::string(buf, kBufSize)
+                              << std::endl;
+                });
+        });
+}
+
+void runClient(KernelEventListener& listener) {
+    auto serverSocket = tcpopen("0.0.0.0", 8000);
+    auto stdinfd = fileno(stdin);
+
+    // Read data from stdin and send it to the server.
+    listener.subscribe(stdinfd, KernelEventListener::EventType::kRead)
+        .then([&listener, serverSocket](struct kevent kev) {
+            const int kBufSize = 1024;
+            char buf[kBufSize];
+
+            memset(buf, 0, kBufSize);
+
+            if (read(fileno(stdin), buf, kBufSize) < 0) diep("read()");
+            if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+        });
+
+    listener.subscribe(serverSocket, KernelEventListener::EventType::kRead)
+        .then([serverSocket](struct kevent kev) {
+            std::cout << "received response from server" << std::endl;
+            const int kBufSize = 1024;
+            char buf[kBufSize];
+
+            // Read the response from the server.
+            memset(buf, 0, kBufSize);
+            if (read(serverSocket, buf, kBufSize) < 0) diep("read()");
+
+            std::cout << std::string(buf, kBufSize) << std::endl;
+        });
 }
 
 void getKeyboardInputAsync() {
@@ -607,7 +686,7 @@ Future<std::string> getKeyboardInput(Executor& e) {
     return f;
 }
 
-int main() {
+int main(int argc, char** argv) {
     // getKeyboardInputAsync();
     //    auto keyboardInput = getKeyboardInput();
     //    keyboardInput.then([](std::string input) {
@@ -654,6 +733,7 @@ int main() {
     // auto listOfNumbers = makeList(3).append(4.2).append(20ull);
     // auto sum = listOfNumbers.fold(
     //    [](auto currentSum, auto next) { return currentSum + next; });
+
     // std::cout << "sum: " << sum << std::endl;
 
     // auto newListOfNumbersWithMoreNumbers =
@@ -667,47 +747,52 @@ int main() {
     // std::cout << "\n\n";
 
     Executor executor;
-    //    UserInputSubscriptionService inputService(executor);
-    //    inputService.run();
+    // UserInputSubscriptionService inputService(executor);
+    // inputService.run();
     KernelEventListener keventListener(executor);
     keventListener.run();
-    doNetworkStuff(keventListener);
 
-    //    auto chain =
-    //        makeList([&] {
-    //            std::cout << "Process: Waiting to hear foo... " << std::endl;
-    //            return inputService.subscribe("foo");
+    if (argc == 1) {
+        runServer(keventListener);
+    } else if (argc > 1) {
+        std::cout << "Run client!" << std::endl;
+        runClient(keventListener);
+    }
+
+    // auto chain =
+    //    makeList([&] {
+    //        std::cout << "Process: Waiting to hear foo... " << std::endl;
+    //        return inputService.subscribe("foo");
+    //    })
+    //        .append([&](std::string s) {
+    //            std::cout << "Process: Saw input: " << s << std::endl;
+    //            std::cout << "Process: Waiting to hear bar...: " << std::endl;
+    //            return inputService.subscribe("bar");
     //        })
-    //            .append([&](std::string s) {
-    //                std::cout << "Process: Saw input: " << s << std::endl;
-    //                std::cout << "Process: Waiting to hear bar...: " <<
-    //                std::endl; return inputService.subscribe("bar");
-    //            })
-    //            .append([](std::string s) {
-    //                std::cout << "Process: Saw input: " << s << std::endl;
-    //            });
+    //        .append([](std::string s) {
+    //            std::cout << "Process: Saw input: " << s << std::endl;
+    //        });
 
-    //    auto nestedChain =
-    //        makeList([] { return 3; })
-    //            .append([&](int i) {
-    //                std::cout << "Second in chain, i = " << i << std::endl;
-    //                return makeList([&] { return 5; }).append([&](int i) {
-    //                    std::cout << "in nested thingie" << std::endl;
-    //                    return makeList([] { return 10.0; }).append([&](float
-    //                    x) {
-    //                        std::cout << "in double nested thingie: x = " << x
-    //                                  << std::endl;
-    //                        return inputService.subscribe("hello");
-    //                    });
+    // auto nestedChain =
+    //    makeList([] { return 3; })
+    //        .append([&](int i) {
+    //            std::cout << "Second in chain, i = " << i << std::endl;
+    //            return makeList([&] { return 5; }).append([&](int i) {
+    //                std::cout << "in nested thingie" << std::endl;
+    //                return makeList([] { return 10.0; }).append([&](float x) {
+    //                    std::cout << "in double nested thingie: x = " << x
+    //                              << std::endl;
+    //                    return inputService.subscribe("hello");
     //                });
-    //            })
-    //            .append([](std::string s) {
-    //                std::cout << s << std::endl;
-    //                std::cout << "Third in nested chain" << std::endl;
-    //                // TODO this should work w/ void return... works
-    //                // in wandbox return 3;
-    //            })
-    //            .append([] { return 10; });
+    //            });
+    //        })
+    //        .append([](std::string s) {
+    //            std::cout << s << std::endl;
+    //            std::cout << "Third in nested chain" << std::endl;
+    //            // TODO this should work w/ void return... works
+    //            // in wandbox return 3;
+    //        })
+    //        .append([] { return 10; });
     //
     //    std::cout << "\n\n";
     //
@@ -742,11 +827,12 @@ int main() {
     //    //    execute(chain, executor);
     //    //}
     //
-    //    for (auto i = 0; i < 10; ++i) {
+
+    // for (auto i = 0; i < 10; ++i) {
     //        //
-    // execute(chain, executor);
+    //  execute(chain, executor);
     //        // execute(nestedChain, executor);
-    //    }
+    // }
     //    auto i = 0;
     //
 
