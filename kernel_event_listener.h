@@ -9,6 +9,10 @@ void diep(const char* s) {
     exit(EXIT_FAILURE);
 }
 
+/**
+ * Service that listens to kernel events with kevent/kqueue and allows callers
+ * to subscribe to certain events on file descriptors.
+ */
 class KernelEventListener {
    public:
     KernelEventListener(Executor& e) : _executor(e), _kernelQueue(kqueue()) {
@@ -24,6 +28,15 @@ class KernelEventListener {
         kWrite = EVFILT_WRITE,
     };
 
+    /**
+     * Returns a Future that will be triggered *each time* an event with the
+     * specified type occurs. The Future will contain the corresponding kevent
+     * type.
+     *
+     * TODO: Use a different type for this (e.g. UnorderedStream) that is
+     * actually supposed to be multi-use. Right now it's just a coincidence of
+     * the Future implementation that it'll work several times.
+     */
     Future<struct kevent> subscribe(int fd, EventType type) {
         _eventsToMonitor.emplace_back();
         _monitoredEventPromises[fd];
@@ -37,17 +50,11 @@ class KernelEventListener {
         // Just poll - never block.
         struct timespec timeout = {0, 0};
         loop(_executor, [this, timeout]() mutable {
-            // std::cout << "LOOP: " << _eventsToMonitor.size() << std::endl;
-
             if (_eventsToMonitor.size() > 0) {
-                // std::cout << "about to block on kevent" << std::endl;
-
                 int nev =
                     kevent(_kernelQueue, _eventsToMonitor.data(),
                            _eventsToMonitor.size(), _eventsReceived.data(),
                            _eventsReceived.size(), &timeout);
-
-                // std::cout << "done blocking on kevent" << std::endl;
 
                 if (nev < 0) {
                     diep("kevent()");
@@ -60,9 +67,6 @@ class KernelEventListener {
                                     strerror(_eventsReceived[i].data));
                             exit(EXIT_FAILURE);
                         }
-                        std::cout << "_monitoredEventPromises.size(): "
-                                  << _monitoredEventPromises.size()
-                                  << std::endl;
 
                         _monitoredEventPromises[_eventsReceived[i].ident].set(
                             _eventsReceived[i]);

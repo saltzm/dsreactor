@@ -79,6 +79,7 @@ constexpr auto execute(CallableList&& list, Executor& executor) {
             executeImpl(std::move(list), executor);
         });
 }
+
 template <typename T, typename Enable = void>
 struct GetReturnTypeImpl {
     using type = T;
@@ -93,31 +94,26 @@ template <typename T>
 using GetReturnType = typename GetReturnTypeImpl<T>::type;
 
 template <typename ComputationList, typename Result>
-class Process {
+class Strand {
    public:
-    constexpr Process(ComputationList computationList)
+    constexpr Strand(ComputationList computationList)
         : _list(std::move(computationList)) {}
 
     template <typename T>
     constexpr auto then(T&& end) && {
         using FlatResult = GetReturnType<Result>;
 
-        auto newComputationList = std::move(_list).append(end);
-        return Process<decltype(newComputationList),
-                       decltype(end(FlatResult()))>(
-            std::move(newComputationList));
+        if constexpr (std::is_void_v<FlatResult>) {
+            auto newComputationList = std::move(_list).append(end);
+            return Strand<decltype(newComputationList), decltype(end())>(
+                std::move(newComputationList));
+        } else {
+            auto newComputationList = std::move(_list).append(end);
+            return Strand<decltype(newComputationList),
+                          decltype(end(FlatResult()))>(
+                std::move(newComputationList));
+        }
     }
-
-    //    template <typename Input>
-    //    auto execute(Executor& executor, Input&& input) {
-    //        auto x = _head(input);
-    //        if constexpr (!std::is_null_pointer<Tail>::value) {
-    //            executor.schedule([&executor, x = std::move(x), this] {
-    //                _tail.execute(executor, std::move(x));
-    //            });
-    //        }
-    //    }
-    //
 
     Future<Result> execute(Executor& executor) {
         Promise<Result> promise;
@@ -135,10 +131,8 @@ class Process {
     ComputationList _list;
 };
 
-template <typename Callable>
-static constexpr auto makeProcess(Callable&& callable) {
-    auto initList = List(std::forward<Callable>(callable));
-    return Process<decltype(initList), decltype(callable())>(
-        std::move(initList));
+static constexpr auto makeStrand() {
+    auto initList = List([] {});
+    return Strand<decltype(initList), void>(std::move(initList));
 }
 

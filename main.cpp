@@ -244,34 +244,22 @@ void testKernelEventListener(Executor& executor,
 
 void testUserInputSubscriptionService(
     Executor& executor, UserInputSubscriptionService& inputService) {
-    auto chain =
-        makeList([&] {
-            std::cout << "Process: Waiting to hear foo... " << std::endl;
-            return inputService.subscribe("foo");
-        })
-            .append([&](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
-                std::cout << "Process: Waiting to hear bar...: " << std::endl;
-                return inputService.subscribe("bar");
-            })
-            .append([](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
-            });
-
     auto chain2 =
-        // Processes are your "lazy futures"
-        makeProcess([&] {
-            std::cout << "Process: Waiting to hear foo... " << std::endl;
-            // subscribe returns a Future<std::string> that gets flattened
-            return inputService.subscribe("foo");
-        })
+        // Strands are your "lazy futures"
+        makeStrand()
+            .then([&] {
+                std::cout << "Strand: Waiting to hear foo... " << std::endl;
+                // subscribe returns a Future<std::string> that gets flattened
+                return inputService.subscribe("foo");
+            })
             .then([&](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
-                return makeProcess([&] {
-                           std::cout << "Process: Waiting to hear bar...: "
-                                     << std::endl;
-                           return inputService.subscribe("bar");
-                       })
+                std::cout << "Strand: Saw input: " << s << std::endl;
+                return makeStrand()
+                    .then([&] {
+                        std::cout << "Strand: Waiting to hear bar...: "
+                                  << std::endl;
+                        return inputService.subscribe("bar");
+                    })
                     .then([&](std::string s) {
                         std::cout << "Nested process: stuff " << std::endl;
                         return s;
@@ -279,15 +267,16 @@ void testUserInputSubscriptionService(
                     .execute(executor);
             })
             .then([](std::string s) {
-                std::cout << "Process: Saw input: " << s << std::endl;
+                std::cout << "Strand: Saw input: " << s << std::endl;
                 return 17;
             });
+
     for (auto i = 0; i < 10; ++i) {
         // "Future" is just a one-off event trigger thing that takes a single
         // continuation
         Future<int> fut = chain2.execute(executor);
         fut.then(
-            [](int i) { std::cout << "Process result: " << i << std::endl; });
+            [](int i) { std::cout << "Strand result: " << i << std::endl; });
     }
 }
 
@@ -298,9 +287,9 @@ int main(int argc, char** argv) {
     inputService.run();
     testUserInputSubscriptionService(executor, inputService);
 
-    KernelEventListener keventListener(executor);
-    keventListener.run();
-    testKernelEventListener(executor, keventListener, argc);
+    // KernelEventListener keventListener(executor);
+    // keventListener.run();
+    // testKernelEventListener(executor, keventListener, argc);
 
     std::cout << "Starting executor" << std::endl;
     executor.run();
