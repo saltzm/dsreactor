@@ -68,9 +68,8 @@ class Executor {
     using Callable = std::function<void()>;
 
    public:
-    ~Executor() {
-        std::cout << "_tasksExecuted: " << _tasksExecuted << std::endl;
-    }
+    ~Executor() {}
+
     void schedule(Callable&& callable) {
         queue.emplace_back(std::move(callable));
     }
@@ -84,6 +83,10 @@ class Executor {
             }
             queue.pop_front();
             ++_tasksExecuted;
+            if (_tasksExecuted % 10000000 == 0) {
+                // std::cout << "_tasksExecuted: " << _tasksExecuted <<
+                // std::endl;
+            }
         }
     }
 
@@ -160,12 +163,20 @@ class List {
         }
     }
 
-    auto head() { return _head; }
+    auto& head() { return _head; }
 
-    auto tail() { return _tail; }
+    auto& tail() { return _tail; }
+
+    auto back() {
+        if constexpr (std::is_null_pointer<Tail>::value) {
+            return _head;
+        } else {
+            return _tail.back();
+        }
+    }
 
     template <typename Input>
-    auto execute(Executor& executor, Input&& input) {
+    constexpr auto execute(Executor& executor, Input&& input) {
         auto x = _head(input);
         if constexpr (!std::is_null_pointer<Tail>::value) {
             executor.schedule([&executor, x = std::move(x), this] {
@@ -174,7 +185,7 @@ class List {
         }
     }
 
-    auto execute(Executor& executor) {
+    constexpr auto execute(Executor& executor) {
         auto x = _head();
         if constexpr (!std::is_null_pointer<Tail>::value) {
             executor.schedule([&executor, x = std::move(x), this] {
@@ -196,9 +207,17 @@ class List {
     Tail _tail;
 };
 
+template <typename>
+struct IsList : public std::false_type {};
+
+template <typename... T>
+struct IsList<List<T...>> : public std::true_type {};
+
 template <typename T>
 class Future {
    public:
+    using value_type = T;
+
     void set(T t) {
         if (_state->_continuation) {
             auto& fn = *(_state->_continuation);
@@ -225,6 +244,35 @@ class Future {
     std::shared_ptr<State> _state{std::make_shared<State>()};
 };
 
+template <>
+class Future<void> {
+   public:
+    void set() {
+        if (_state->_continuation) {
+            auto& fn = *(_state->_continuation);
+            fn();
+        } else {
+            _state->_isReady = true;
+        }
+    }
+
+    template <typename Callable>
+    auto then(Callable&& callable) {
+        if (_state->_isReady) {
+            callable();
+        } else {
+            _state->_continuation.emplace(std::move(callable));
+        }
+    }
+
+   private:
+    struct State {
+        bool _isReady{false};
+        std::optional<std::function<void()>> _continuation;
+    };
+    std::shared_ptr<State> _state{std::make_shared<State>()};
+};
+
 template <typename T>
 class Promise {
    public:
@@ -235,11 +283,15 @@ class Promise {
     Future<T> _future;
 };
 
-template <typename>
-struct IsList : public std::false_type {};
+template <>
+class Promise<void> {
+   public:
+    void set() { _future.set(); }
+    Future<void> getFuture() { return _future; }
 
-template <typename... T>
-struct IsList<List<T...>> : public std::true_type {};
+   private:
+    Future<void> _future;
+};
 
 template <typename>
 struct IsFuture : public std::false_type {};
@@ -247,13 +299,33 @@ struct IsFuture : public std::false_type {};
 template <typename T>
 struct IsFuture<Future<T>> : public std::true_type {};
 
+template <typename T, typename Enable = void>
+struct GetReturnTypeImpl {
+    using type = T;
+};
+
+template <typename T>
+struct GetReturnTypeImpl<T, std::enable_if_t<IsFuture<T>::value>> {
+    using type = typename T::value_type;
+};
+
+template <typename T>
+using GetReturnType = typename GetReturnTypeImpl<T>::type;
+
+template <typename T>
+auto makeList(T&& t) {
+    return List(std::forward<T>(t));
+}
+
 // TODO make all these cool and move-y and non leaky
 template <typename CallableList, typename Input>
 constexpr auto executeImpl(CallableList&& list, Executor& executor,
                            Input&& input) {
+    using TailType = std::decay_t<decltype(list.tail())>;
+
     if constexpr (std::is_void<decltype(list.head()(input))>::value) {
         list.head()(input);
-        if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
+        if constexpr (!std::is_null_pointer<TailType>::value) {
             executor.schedule(
                 [list = std::forward<CallableList>(list), &executor]() mutable {
                     executeImpl(list.tail(), executor);
@@ -261,7 +333,7 @@ constexpr auto executeImpl(CallableList&& list, Executor& executor,
         }
     } else {
         auto x = list.head()(input);
-        if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
+        if constexpr (!std::is_null_pointer<TailType>::value) {
             executor.schedule([list = std::forward<CallableList>(list),
                                &executor, x = std::move(x)]() mutable {
                 if constexpr (IsList<decltype(x)>::value) {
@@ -283,9 +355,11 @@ constexpr auto executeImpl(CallableList&& list, Executor& executor,
 
 template <typename CallableList>
 constexpr auto executeImpl(CallableList&& list, Executor& executor) {
+    using TailType = std::decay_t<decltype(list.tail())>;
+
     if constexpr (std::is_void<decltype(list.head()())>::value) {
         list.head()();
-        if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
+        if constexpr (!std::is_null_pointer<TailType>::value) {
             executor.schedule(
                 [list = std::forward<CallableList>(list), &executor]() mutable {
                     executeImpl(list.tail(), executor);
@@ -293,7 +367,7 @@ constexpr auto executeImpl(CallableList&& list, Executor& executor) {
         }
     } else {
         auto x = list.head()();
-        if constexpr (!std::is_null_pointer<decltype(list.tail())>::value) {
+        if constexpr (!std::is_null_pointer<TailType>::value) {
             executor.schedule([list = std::forward<CallableList>(list),
                                &executor, x = std::move(x)]() mutable {
                 if constexpr (IsList<decltype(x)>::value) {
@@ -319,9 +393,54 @@ constexpr auto execute(CallableList&& list, Executor& executor) {
         });
 }
 
-template <typename T>
-auto makeList(T&& t) {
-    return List(std::forward<T>(t));
+template <typename ComputationList, typename Result>
+class Process {
+   public:
+    constexpr Process(ComputationList computationList)
+        : _list(std::move(computationList)) {}
+
+    template <typename T>
+    constexpr auto then(T&& end) && {
+        using FlatResult = GetReturnType<Result>;
+
+        auto newComputationList = std::move(_list).append(end);
+        return Process<decltype(newComputationList),
+                       decltype(end(FlatResult()))>(
+            std::move(newComputationList));
+    }
+
+    //    template <typename Input>
+    //    auto execute(Executor& executor, Input&& input) {
+    //        auto x = _head(input);
+    //        if constexpr (!std::is_null_pointer<Tail>::value) {
+    //            executor.schedule([&executor, x = std::move(x), this] {
+    //                _tail.execute(executor, std::move(x));
+    //            });
+    //        }
+    //    }
+    //
+
+    Future<Result> execute(Executor& executor) {
+        Promise<Result> promise;
+        auto fut = promise.getFuture();
+
+        auto newList =
+            std::move(_list).append([promise = std::move(promise)](
+                                        auto& x) mutable { promise.set(x); });
+
+        ::execute(newList, executor);
+        return fut;
+    }
+
+   private:
+    ComputationList _list;
+};
+
+template <typename Callable>
+static constexpr auto makeProcess(Callable&& callable) {
+    auto initList = List(std::forward<Callable>(callable));
+    return Process<decltype(initList), decltype(callable())>(
+        std::move(initList));
 }
 
 template <typename T>
@@ -435,6 +554,7 @@ int tcpbind(const char* host, int port) {
         perror("bind");
         return 1;
     }
+    // TODO handle backlog in stream
     assert(listen(sckfd, 5) != -1);
 
     std::cout << "sckfd: " << sckfd << std::endl;
@@ -634,9 +754,109 @@ void runServer(KernelEventListener& listener) {
         });
 }
 
+using Buffer = std::vector<char>;
+// class Buffer {
+//   public:
+//    Buffer(std::uint64_t size)
+//        : _size(size), _data(malloc(size * sizeof(char))) {}
+//
+//    char* data() { return _data; }
+//
+//   private:
+//    std::uint64_t _size;
+//    char* _data;
+//};
+
+// template <typename T>
+// class CircularBuffer {
+//    public:
+//     CircularBuffer(size_t size) : _data(size) {}
+//
+//     void push_back(T t) {
+//         auto nextIndex = (_endIdx + 1) % data.size();
+//         // TODO handle wrapping
+//         assert(nextIndex < _startIdx);
+//     }
+//
+//     void size() { return _endIdx - _startIdx + 1; }
+//
+//    private:
+//     std::uint64_t _startIdx;
+//     std::uint64_t _endIdx;
+//     std::vector<T> _data;
+// };
+
+class TCPConnection {
+   public:
+    TCPConnection(KernelEventListener& listener, int socket)
+        : _listener(listener), _socket(socket), _incomingMessages() {
+        listener.subscribe(socket, KernelEventListener::EventType::kRead)
+            .then([this, socket](const struct kevent& kev) {
+                auto bytesReady = kev.data;
+                Buffer buf(bytesReady);
+                if (::read(socket, buf.data(), bytesReady) < 0) {
+                    diep("read()");
+                }
+                if (_readWaiting) {
+                    _readWaiting->set(std::move(buf));
+                    _readWaiting.reset();
+                } else {
+                    _incomingMessages.emplace(std::move(buf));
+                }
+            });
+    }
+
+    Future<Buffer> read(std::uint64_t numBytes) {
+        // If there's anything in _incomingMessages, pop it and return it
+        // immediately.
+        if (!_incomingMessages.empty()) {
+            Promise<Buffer> promise;
+            promise.set(std::move(_incomingMessages.front()));
+            _incomingMessages.pop();
+            return promise.getFuture();
+        } else {
+            _readWaiting.emplace();
+            return _readWaiting->getFuture();
+        }
+    }
+
+    // Future<void> write() {}
+
+   private:
+    KernelEventListener& _listener;
+    int _socket;
+    std::optional<Promise<Buffer>> _readWaiting;
+    std::queue<Buffer> _incomingMessages;
+};
+
 void runClient(KernelEventListener& listener) {
     auto serverSocket = tcpopen("0.0.0.0", 8000);
     auto stdinfd = fileno(stdin);
+
+    //    TCPConnection connection(serverSocket);
+
+    //    loop(executor, [connection = std::move(connection)] {
+    //        execute(makeList([] { return connection.read(); })
+    //                    .append([](const Buffer& buf) {
+    //                        if (write(serverSocket, buf, kBufSize) < 0)
+    //                            diep("write()");
+    //                    }),
+    //                executor);
+    //    });
+
+    // A few useful things:
+    //  1) On every event, call a callback. These do not have to synchronize
+    //     with each other.
+    //
+    //     Example: Accepting connections on a socket. Processing those
+    //     connections can happen concurrently with each other.
+    //
+    //  2) Read a sequential stream of data and do something for each data item.
+    //     E.g. read from a connection and process each message in order.
+    //
+    //  3) Call a callback once on completion of an event. E.g. write a message
+    //     when data is ready. Most of the time this could probably also be a
+    //     stream/channel?
 
     // Read data from stdin and send it to the server.
     listener.subscribe(stdinfd, KernelEventListener::EventType::kRead)
@@ -647,7 +867,13 @@ void runClient(KernelEventListener& listener) {
             memset(buf, 0, kBufSize);
 
             if (read(fileno(stdin), buf, kBufSize) < 0) diep("read()");
+
+            //            listener
+            //                .onNextEvent(serverSocket,
+            //                             KernelEventListener::EventType::kWrite)
+            //                .then([serverSocket, buf, kBufSize] {
             if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+            //                });
         });
 
     listener.subscribe(serverSocket, KernelEventListener::EventType::kRead)
@@ -662,6 +888,25 @@ void runClient(KernelEventListener& listener) {
 
             std::cout << std::string(buf, kBufSize) << std::endl;
         });
+    // Ideal API:
+
+    // tcpListener.openReadStream(serverSocket,
+    // KernelEventListener::EventType::kRead)
+    //    TCPListener::connect(serverSocket)
+    //        .incoming()
+    //        .forEach([](const Buffer& buf) {
+    //            Process::create(executor)
+    //                .then([]() {
+    //                    auto msg = parse(buf);
+    //                    return msg;
+    //                })
+    //                .then([](const Request& parsedRequest) {
+    //                    return storageEngine.get(parsedRequest.key);
+    //                })
+    //                .then([](const Value& val) {
+    //
+    //                })
+    //        });
 }
 
 void getKeyboardInputAsync() {
@@ -752,31 +997,63 @@ int main(int argc, char** argv) {
     // std::cout << "\n\n";
 
     Executor executor;
-    // UserInputSubscriptionService inputService(executor);
-    // inputService.run();
-    KernelEventListener keventListener(executor);
-    keventListener.run();
+    UserInputSubscriptionService inputService(executor);
+    inputService.run();
+    // KernelEventListener keventListener(executor);
+    // keventListener.run();
 
-    if (argc == 1) {
-        runServer(keventListener);
-    } else if (argc > 1) {
-        std::cout << "Run client!" << std::endl;
-        runClient(keventListener);
-    }
+    //    if (argc == 1) {
+    //        runServer(keventListener);
+    //    } else if (argc > 1) {
+    //        std::cout << "Run client!" << std::endl;
+    //        runClient(keventListener);
+    //    }
 
-    // auto chain =
-    //    makeList([&] {
-    //        std::cout << "Process: Waiting to hear foo... " << std::endl;
-    //        return inputService.subscribe("foo");
-    //    })
-    //        .append([&](std::string s) {
-    //            std::cout << "Process: Saw input: " << s << std::endl;
-    //            std::cout << "Process: Waiting to hear bar...: " << std::endl;
-    //            return inputService.subscribe("bar");
+    //    auto chain =
+    //        makeList([&] {
+    //            std::cout << "Process: Waiting to hear foo... " << std::endl;
+    //            return inputService.subscribe("foo");
     //        })
-    //        .append([](std::string s) {
-    //            std::cout << "Process: Saw input: " << s << std::endl;
-    //        });
+    //            .append([&](std::string s) {
+    //                std::cout << "Process: Saw input: " << s << std::endl;
+    //                std::cout << "Process: Waiting to hear bar...: " <<
+    //                std::endl; return inputService.subscribe("bar");
+    //            })
+    //            .append([](std::string s) {
+    //                std::cout << "Process: Saw input: " << s << std::endl;
+    //            });
+
+    auto chain2 =
+        // Processes are your "lazy futures"
+        makeProcess([&] {
+            std::cout << "Process: Waiting to hear foo... " << std::endl;
+            // subscribe returns a Future<std::string> that gets flattened
+            return inputService.subscribe("foo");
+        })
+            .then([&](std::string s) {
+                std::cout << "Process: Saw input: " << s << std::endl;
+                return makeProcess([&] {
+                           std::cout << "Process: Waiting to hear bar...: "
+                                     << std::endl;
+                           return inputService.subscribe("bar");
+                       })
+                    .then([&](std::string s) {
+                        std::cout << "Nested process: stuff " << std::endl;
+                        return s;
+                    })
+                    .execute(executor);
+            })
+            .then([](std::string s) {
+                std::cout << "Process: Saw input: " << s << std::endl;
+                return 17;
+            });
+    for (auto i = 0; i < 10; ++i) {
+        // "Future" is just a one-off event trigger thing that takes a single
+        // continuation
+        Future<int> fut = chain2.execute(executor);
+        fut.then(
+            [](int i) { std::cout << "Process result: " << i << std::endl; });
+    }
 
     // auto nestedChain =
     //    makeList([] { return 3; })
@@ -784,8 +1061,10 @@ int main(int argc, char** argv) {
     //            std::cout << "Second in chain, i = " << i << std::endl;
     //            return makeList([&] { return 5; }).append([&](int i) {
     //                std::cout << "in nested thingie" << std::endl;
-    //                return makeList([] { return 10.0; }).append([&](float x) {
-    //                    std::cout << "in double nested thingie: x = " << x
+    //                return makeList([] { return 10.0;
+    //                }).append([&](float x) {
+    //                    std::cout << "in double nested thingie: x = " <<
+    //                    x
     //                              << std::endl;
     //                    return inputService.subscribe("hello");
     //                });
@@ -811,7 +1090,8 @@ int main(int argc, char** argv) {
     //    //            executor.schedule([s] {
     //    //                std::cout << s << std::endl;
     //    //                std::cout << "X Third in chain" << std::endl;
-    //    //                // TODO this should work w/ void return... works in
+    //    //                // TODO this should work w/ void return...
+    //    works in
     //    //                // wandbox
     //    //                // return 3;
     //    //            });
