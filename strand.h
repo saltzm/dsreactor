@@ -5,7 +5,7 @@
 #include "list.h"
 
 // TODO make all these cool and move-y and non leaky
-template <typename CallableList, typename Input>
+template <typename CallableList, typename Input, typename Executor>
 constexpr auto executeImpl(CallableList&& list, Executor& executor,
                            Input&& input) {
     using TailType = std::decay_t<decltype(list.tail())>;
@@ -40,7 +40,7 @@ constexpr auto executeImpl(CallableList&& list, Executor& executor,
     }
 }
 
-template <typename CallableList>
+template <typename CallableList, typename Executor>
 constexpr auto executeImpl(CallableList&& list, Executor& executor) {
     using TailType = std::decay_t<decltype(list.tail())>;
 
@@ -115,6 +115,7 @@ class Strand {
         }
     }
 
+    template <typename Executor>
     Future<Result> execute(Executor& executor) {
         Promise<Result> promise;
         auto fut = promise.getFuture();

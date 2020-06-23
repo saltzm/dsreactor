@@ -110,8 +110,9 @@ void runServer(KernelEventListener& listener) {
                     // TODO make also async
                     if (write(connfd, buf, kBufSize) < 0) diep("write()");
 
-                    std::cout << "Client said: " << std::string(buf, kBufSize)
-                              << std::endl;
+                    //                    std::cout << "Client said: " <<
+                    //                    std::string(buf, kBufSize)
+                    //                              << std::endl;
                 });
         });
 }
@@ -190,6 +191,40 @@ void runClient(KernelEventListener& listener) {
         });
 }
 
+void runClientBM(KernelEventListener& listener) {
+    for (auto j = 0; j < 20; ++j) {
+        auto serverSocket = tcpopen("0.0.0.0", 8000);
+
+        //    auto stdinfd = fileno(stdin);
+
+        const int kBufSize = 1024;
+        char buf[kBufSize];
+        memset(buf, 0, kBufSize);
+
+        if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+
+        int* i = new int;
+        listener.subscribe(serverSocket, KernelEventListener::EventType::kRead)
+            .then([i, j, serverSocket](struct kevent kev) {
+                // std::cout << "received response from server" << std::endl;
+                const int kBufSize = 1024;
+                char buf[kBufSize];
+
+                // Read the response from the server.
+                memset(buf, 0, kBufSize);
+                if (read(serverSocket, buf, kBufSize) < 0) diep("read()");
+
+                if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+
+                // std::cout << std::string(buf, kBufSize) << std::endl;
+                ++(*i);
+                if (*i % 1000 == 0)
+                    std::cout << "client j... " << j << " i: " << *i
+                              << std::endl;
+            });
+    }
+}
+
 void testList() {
     List l(3);
     auto fullList = makeList(3).prepend("hi").prepend(4.2);
@@ -236,11 +271,156 @@ void testKernelEventListener(Executor& executor,
                              KernelEventListener& keventListener, int argc) {
     if (argc == 1) {
         runServer(keventListener);
-    } else if (argc > 1) {
+    } else if (argc == 2) {
         std::cout << "Run client!" << std::endl;
         runClient(keventListener);
+    } else if (argc > 2) {
+        std::cout << "Run client bm!" << std::endl;
+        runClientBM(keventListener);
     }
 }
+
+template <typename Executor>
+void testStrandBasic(Executor& executor) {
+    auto chain2 =
+        // Strands are your "lazy futures"
+        makeStrand()
+            .then([&] {
+                std::cout << "Strand: Waiting to hear foo... " << std::endl;
+                // subscribe returns a Future<std::string> that gets flattened
+                return "hello";
+            })
+            .then([&](std::string s) {
+                std::cout << "Strand: Saw input: " << s << std::endl;
+                return makeStrand()
+                    .then([&] {
+                        std::cout << "Strand: Waiting to hear bar...: "
+                                  << std::endl;
+                        return "hello again";
+                    })
+                    .then([&](std::string s) {
+                        std::cout << "Nested process: stuff " << std::endl;
+                        return s;
+                    })
+                    .execute(executor);
+            })
+            .then([](std::string s) {
+                std::cout << "Strand: Saw input: " << s << std::endl;
+                return 17;
+            });
+
+    for (auto i = 0; i < 10; ++i) {
+        // "Future" is just a one-off event trigger thing that takes a single
+        // continuation
+        Future<int> fut = chain2.execute(executor);
+        fut.then(
+            [](int i) { std::cout << "Strand result: " << i << std::endl; });
+    }
+}
+
+void testStrandAlternative(Executor& executor) {
+    for (auto i = 0; i < 10; ++i) {
+        // Strands are your "lazy futures"
+        executor.schedule([&executor] {
+            std::cout << "Strand: Waiting to hear foo... " << std::endl;
+            // subscribe returns a Future<std::string> that gets flattened
+            std::string s = "hello";
+            executor.schedule([&executor, s] {
+                std::cout << "Strand: Saw input: " << s << std::endl;
+
+                executor.schedule([&executor] {
+                    std::cout << "Strand: Waiting to hear bar...: "
+                              << std::endl;
+                    std::string s2 = "hello again";
+
+                    executor.schedule([&executor, s2] {
+                        std::cout << "Nested process: stuff " << std::endl;
+
+                        executor.schedule([&executor, s2] {
+                            std::cout << "Strand: Saw input: " << s2
+                                      << std::endl;
+                            return 17;
+                        });
+                    });
+                });
+            });
+        });
+    }
+}
+
+// class Environment {
+//   public:
+//    Environment(Executor& executor) : _executor(executor) {}
+//
+//    class IdAllocator {
+//       public:
+//        using Id = std::uint64_t;
+//
+//        Id newId() {
+//            if (_freeIds.empty()) {
+//                return ++_maxId;
+//            } else {
+//                auto id = _freeIds.front();
+//                _freeIds.pop_front();
+//                return id;
+//            }
+//        }
+//
+//        void freeId(Id id) { _freeIds.push_back(id); }
+//
+//       private:
+//        std::uint64_t _maxId{0};
+//        std::list<Id> _freeIds;
+//    };
+//
+//    class ExecutionContext {
+//        using Callable = std::function<void()>;
+//
+//       public:
+//        ExecutionContext() = delete;
+//        ExecutionContext(Environment* environment, IdAllocator::Id id)
+//            : _environment(environment), _id(id) {}
+//
+//        ~ExecutionContext() {
+//            _environment->_runningExecutionContexts.erase(_id);
+//            _environment->_idAllocator.freeId(_id);
+//        }
+//
+//        void schedule(Callable&& callable) { _queue.push(callable); }
+//
+//        void runNext() {
+//            _environment->_executor.schedule(std::move(_queue.front()));
+//            _queue.pop();
+//        }
+//
+//       private:
+//        Environment* _environment;
+//        IdAllocator::Id _id;
+//        std::queue<Callable> _queue;
+//    };
+//
+//    std::unique_ptr<ExecutionContext> createContext() {
+//        auto id = _idAllocator.newId();
+//        auto newContext = std::make_unique<ExecutionContext>(this, id);
+//        _runningExecutionContexts.emplace(id, newContext.get());
+//        return newContext;
+//    }
+//
+//    void run() {
+//        loop(_executor, [this]() mutable {
+//            for (auto& [id, executionContext] : _runningExecutionContexts) {
+//                executionContext->runNext();
+//            }
+//            return false;
+//        });
+//    }
+//
+//   private:
+//    Executor& _executor;
+//    IdAllocator _idAllocator;
+//    std::unordered_map<IdAllocator::Id, ExecutionContext*>
+//        _runningExecutionContexts;
+//};
 
 void testUserInputSubscriptionService(
     Executor& executor, UserInputSubscriptionService& inputService) {
@@ -280,16 +460,57 @@ void testUserInputSubscriptionService(
     }
 }
 
+#define ASYNC(x) makeStrand().then([&] x)
+#define CREATE_ASYNC_CHAIN(var, body) auto var = makeStrand().then([&]  body
+#define ASYNC_ASSIGN(var, x) \
+    return (x);              \
+    }).then([&](auto (var)) {
+void testUserInputSubscriptionServiceWithMacros(
+    Executor& executor, UserInputSubscriptionService& inputService) {
+    for (auto i = 0; i < 10; ++i) {
+        // Strands are your "lazy futures"
+        auto routine = ASYNC({
+            std::cout << "Strand: Waiting to hear foo... " << std::endl;
+
+            // subscribe returns a Future<std::string> that gets flattened
+            ASYNC_ASSIGN(fooResult, inputService.subscribe("foo"));
+
+            std::cout << "Strand: Saw input: " << fooResult << std::endl;
+
+            auto subroutine = ASYNC({
+                std::cout << "Strand: Waiting to hear bar...: " << std::endl;
+                ASYNC_ASSIGN(barResult, inputService.subscribe("bar"));
+                std::cout << "Nested process: stuff " << std::endl;
+                return barResult;
+            });
+
+            ASYNC_ASSIGN(barResult, subroutine.execute(executor));
+
+            std::cout << "Strand: Saw input: " << barResult << std::endl;
+            return 17;
+        });
+
+        // "Future" is just a one-off event trigger thing that takes a single
+        // continuation
+        routine.execute(executor).then(
+            [](int i) { std::cout << "Strand result: " << i << std::endl; });
+    }
+}
+
 int main(int argc, char** argv) {
     Executor executor;
+    // Environment env(executor);
 
-    UserInputSubscriptionService inputService(executor);
-    inputService.run();
-    testUserInputSubscriptionService(executor, inputService);
+    //    UserInputSubscriptionService inputService(executor);
+    //    inputService.run();
+    //    testUserInputSubscriptionServiceWithMacros(executor, inputService);
 
-    // KernelEventListener keventListener(executor);
-    // keventListener.run();
-    // testKernelEventListener(executor, keventListener, argc);
+    KernelEventListener keventListener(executor);
+    keventListener.run();
+    testKernelEventListener(executor, keventListener, argc);
+
+    // testStrandBasic(executor);
+    // testStrandAlternative(executor);
 
     std::cout << "Starting executor" << std::endl;
     executor.run();
