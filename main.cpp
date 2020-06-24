@@ -98,22 +98,44 @@ void runServer(KernelEventListener& listener) {
 
             std::cout << "Connection accepted!" << std::endl;
 
-            listener.subscribe(connfd, KernelEventListener::EventType::kRead)
-                .then([connfd](struct kevent kev) {
-                    const int kBufSize = 1024;
-                    char buf[kBufSize];
+            const int kBufSize = 1024;
+            struct Buffer {
+                bool hasData{false};
+                char data[kBufSize];
+            };
 
-                    // Read data from the client.
-                    memset(buf, 0, kBufSize);
-                    if (read(connfd, buf, kBufSize) < 0) diep("read()");
-                    // Echo it back.
-                    // TODO make also async
-                    if (write(connfd, buf, kBufSize) < 0) diep("write()");
+            auto bytes = std::make_shared<int>();
+            auto buffer = std::make_shared<Buffer>();
 
-                    //                    std::cout << "Client said: " <<
-                    //                    std::string(buf, kBufSize)
-                    //                              << std::endl;
-                });
+            listener.subscribe(connfd).then([buffer,
+                                             connfd](struct kevent kev) {
+                switch (
+                    static_cast<KernelEventListener::EventType>(kev.filter)) {
+                    case KernelEventListener::EventType::kRead: {
+                        // std::cout << "received response from server"
+                        //          << kev.filter << std::endl;
+
+                        // Read the response from the server.
+                        memset(buffer->data, 0, kBufSize);
+                        if (read(connfd, buffer->data, kBufSize) < 0)
+                            diep("read()");
+
+                        buffer->hasData = true;
+                    } break;
+                    case KernelEventListener::EventType::kWrite: {
+                        // std::cout << "can WRITE" << kev.filter << std::endl;
+
+                        if (buffer->hasData) {
+                            // std::cout << "is WRITE" << kev.filter <<
+                            // std::endl;
+                            // TODO make sure enough data is available
+                            if (write(connfd, buffer->data, kBufSize) < 0)
+                                diep("write()");
+                            buffer->hasData = false;
+                        }
+                    } break;
+                }
+            });
         });
 }
 
@@ -192,7 +214,8 @@ void runClient(KernelEventListener& listener) {
 }
 
 void runClientBM(KernelEventListener& listener) {
-    for (auto j = 0; j < 20; ++j) {
+    auto counter = std::make_shared<int>();
+    for (auto j = 0; j < 256; ++j) {
         auto serverSocket = tcpopen("0.0.0.0", 8000);
 
         //    auto stdinfd = fileno(stdin);
@@ -203,24 +226,48 @@ void runClientBM(KernelEventListener& listener) {
 
         if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
 
-        int* i = new int;
-        listener.subscribe(serverSocket, KernelEventListener::EventType::kRead)
-            .then([i, j, serverSocket](struct kevent kev) {
-                // std::cout << "received response from server" << std::endl;
-                const int kBufSize = 1024;
-                char buf[kBufSize];
+        struct Buffer {
+            bool hasData{false};
+            char data[kBufSize];
+        };
 
-                // Read the response from the server.
-                memset(buf, 0, kBufSize);
-                if (read(serverSocket, buf, kBufSize) < 0) diep("read()");
+        auto bytes = std::make_shared<int>();
+        auto buffer = std::make_shared<Buffer>();
 
-                if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+        listener.subscribe(serverSocket)
+            .then([counter, buffer, j, serverSocket](struct kevent kev) {
+                switch (
+                    static_cast<KernelEventListener::EventType>(kev.filter)) {
+                    case KernelEventListener::EventType::kRead: {
+                        // std::cout << "received response from server"
+                        //          << kev.filter << std::endl;
 
-                // std::cout << std::string(buf, kBufSize) << std::endl;
-                ++(*i);
-                if (*i % 1000 == 0)
-                    std::cout << "client j... " << j << " i: " << *i
-                              << std::endl;
+                        // Read the response from the server.
+                        memset(buffer->data, 0, kBufSize);
+                        if (read(serverSocket, buffer->data, kBufSize) < 0)
+                            diep("read()");
+
+                        buffer->hasData = true;
+                    } break;
+                    case KernelEventListener::EventType::kWrite: {
+                        // std::cout << "can WRITE" << kev.filter << std::endl;
+
+                        if (buffer->hasData) {
+                            // std::cout << "is WRITE" << kev.filter <<
+                            // std::endl;
+                            // TODO make sure enough data is available
+                            if (write(serverSocket, buffer->data, kBufSize) < 0)
+                                diep("write()");
+                            buffer->hasData = false;
+
+                            ++(*counter);
+                            if (*counter % 1000 == 0)
+                                std::cout << "client j... " << j
+                                          << " counter: " << *counter
+                                          << std::endl;
+                        }
+                    } break;
+                }
             });
     }
 }

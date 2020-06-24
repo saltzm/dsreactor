@@ -38,11 +38,30 @@ class KernelEventListener {
      * the Future implementation that it'll work several times.
      */
     Future<struct kevent> subscribe(int fd, EventType type) {
-        _eventsToMonitor.emplace_back();
         _monitoredEventPromises[fd];
-        _eventsReceived.emplace_back();
-        EV_SET(&_eventsToMonitor.back(), fd, int(type), EV_ADD | EV_ENABLE, 0,
-               0, 0);
+        ++_numRegisteredEvents;
+
+        struct kevent events[1];
+        EV_SET(&events[0], fd, int(type), EV_ADD | EV_ENABLE, 0, 0, 0);
+        // TODO handle error
+        assert(::kevent(_kernelQueue, events, 1, 0, 0, 0) != -1);
+        return _monitoredEventPromises[fd].getFuture();
+    }
+
+    Future<struct kevent> subscribe(int fd) {
+        _monitoredEventPromises[fd];
+        ++_numRegisteredEvents;
+
+        constexpr int kNumEventsToListenFor = 2;
+        struct kevent events[kNumEventsToListenFor];
+        // TODO consider EV_CLEAR
+        EV_SET(&events[0], fd, int(EventType::kRead), EV_ADD | EV_ENABLE, 0, 0,
+               0);
+        EV_SET(&events[1], fd, int(EventType::kWrite), EV_ADD | EV_ENABLE, 0, 0,
+               0);
+        // TODO handle error
+        assert(::kevent(_kernelQueue, events, kNumEventsToListenFor, 0, 0, 0) !=
+               -1);
         return _monitoredEventPromises[fd].getFuture();
     }
 
@@ -50,26 +69,28 @@ class KernelEventListener {
         // Just poll - never block.
         struct timespec timeout = {0, 0};
         loop(_executor, [this, timeout]() mutable {
-            if (_eventsToMonitor.size() > 0) {
-                int nev =
-                    kevent(_kernelQueue, _eventsToMonitor.data(),
-                           _eventsToMonitor.size(), _eventsReceived.data(),
-                           _eventsReceived.size(), &timeout);
+            if (_numRegisteredEvents > 0) {
+                constexpr int kNumEventsPerCycle = 128;
+                struct kevent events[kNumEventsPerCycle];
+                int nev = kevent(_kernelQueue, 0, 0, events, kNumEventsPerCycle,
+                                 &timeout);
 
                 if (nev < 0) {
                     diep("kevent()");
                 } else if (nev > 0) {
                     for (auto i = 0; i < nev; i++) {
-                        if (_eventsReceived[i].flags & EV_EOF ||
-                            _eventsReceived[i].flags & EV_ERROR) {
+                        //                        std::cout << "has event: " <<
+                        //                        (int)events[i].filter
+                        //                                  << std::endl;
+                        if (events[i].flags & EV_EOF ||
+                            events[i].flags & EV_ERROR) {
                             /* Report errors */
                             fprintf(stderr, "EV_ERROR: %s\n",
-                                    strerror(_eventsReceived[i].data));
+                                    strerror(events[i].data));
                             exit(EXIT_FAILURE);
                         }
 
-                        _monitoredEventPromises[_eventsReceived[i].ident].set(
-                            _eventsReceived[i]);
+                        _monitoredEventPromises[events[i].ident].set(events[i]);
                     }
                 }
             }
@@ -82,8 +103,7 @@ class KernelEventListener {
 
     int _kernelQueue;
 
-    std::vector<struct kevent> _eventsToMonitor;
+    std::uint64_t _numRegisteredEvents{0};
     std::unordered_map<int, Promise<struct kevent>> _monitoredEventPromises;
-    std::vector<struct kevent> _eventsReceived;
 };
 
