@@ -68,11 +68,14 @@ class KernelEventListener {
     void run() {
         // Just poll - never block.
         struct timespec timeout = {0, 0};
+        // TODO could integrate timer into this service, and then timeout could
+        // be computed based on when the next timer was going to fire
         loop(_executor, [this, timeout]() mutable {
             if (_numRegisteredEvents > 0) {
                 constexpr int kNumEventsPerCycle = 128;
                 struct kevent events[kNumEventsPerCycle];
                 int nev = kevent(_kernelQueue, 0, 0, events, kNumEventsPerCycle,
+                                 // TODO timeout
                                  &timeout);
 
                 if (nev < 0) {
@@ -84,10 +87,11 @@ class KernelEventListener {
                         //                                  << std::endl;
                         if (events[i].flags & EV_EOF ||
                             events[i].flags & EV_ERROR) {
+                            close(events[i].ident);
                             /* Report errors */
-                            fprintf(stderr, "EV_ERROR: %s\n",
-                                    strerror(events[i].data));
-                            exit(EXIT_FAILURE);
+                            // fprintf(stderr, "EV_ERROR: %s\n",
+                            //        strerror(events[i].data));
+                            // exit(EXIT_FAILURE);
                         }
 
                         _monitoredEventPromises[events[i].ident].set(events[i]);

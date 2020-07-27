@@ -1,8 +1,8 @@
 
 #pragma once
 
+#include <deque>
 #include <functional>
-#include <list>
 
 class Executor {
     using Callable = std::function<void()>;
@@ -16,6 +16,7 @@ class Executor {
 
     void run() {
         while (!queue.empty()) {
+            // std::cout << "queue size: " << queue.size() << std::endl;
             auto& next = queue.front();
             try {
                 next();
@@ -32,7 +33,7 @@ class Executor {
 
    private:
     long long _tasksExecuted{0};
-    std::list<Callable> queue;
+    std::deque<Callable> queue;
 };
 
 template <typename Do, typename While, typename Then>

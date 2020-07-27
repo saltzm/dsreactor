@@ -19,6 +19,7 @@
 #include <cstdlib>
 
 #include "kernel_event_listener.h"
+#include "server.h"
 #include "strand.h"
 #include "user_input_subscription_service.h"
 
@@ -44,34 +45,6 @@ int tcpopen(const char* host, int port) {
     return sckfd;
 }
 
-int tcpbind(const char* host, int port) {
-    struct sockaddr_in server;
-    struct hostent* hp;
-    int sckfd;
-
-    if ((hp = gethostbyname(host)) == NULL) diep("gethostbyname()");
-
-    if ((sckfd = socket(PF_INET, SOCK_STREAM, 0)) < 0) diep("socket()");
-
-    server.sin_family = AF_INET;
-    server.sin_port = htons(port);
-    server.sin_addr = *((struct in_addr*)hp->h_addr);
-    memset(&(server.sin_zero), 0, 8);
-
-    int on = 1;
-    setsockopt(sckfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    if (bind(sckfd, (struct sockaddr*)&server, sizeof(server)) == -1) {
-        perror("bind");
-        return 1;
-    }
-    // TODO handle backlog in stream
-    assert(listen(sckfd, 5) != -1);
-
-    std::cout << "sckfd: " << sckfd << std::endl;
-
-    return sckfd;
-}
-
 void sendbuftosck(int sckfd, const char* buf, int len) {
     int bytessent, pos;
 
@@ -88,7 +61,7 @@ void runServer(KernelEventListener& listener) {
 
     listener.subscribe(sockfd, KernelEventListener::EventType::kRead)
         .then([&listener, sockfd](struct kevent kev) {
-            std::cout << "Received new connection!" << std::endl;
+            // std::cout << "Received new connection!" << std::endl;
 
             struct sockaddr_in cliaddr;
             socklen_t cliaddrlen = sizeof(cliaddr);
@@ -96,11 +69,12 @@ void runServer(KernelEventListener& listener) {
             int connfd =
                 accept(sockfd, (struct sockaddr*)&cliaddr, &cliaddrlen);
 
-            std::cout << "Connection accepted!" << std::endl;
+            // std::cout << "Connection accepted!" << std::endl;
 
             const int kBufSize = 1024;
             struct Buffer {
                 bool hasData{false};
+                std::uint64_t numBytesInBuffer{0};
                 char data[kBufSize];
             };
 
@@ -115,12 +89,15 @@ void runServer(KernelEventListener& listener) {
                         // std::cout << "received response from server"
                         //          << kev.filter << std::endl;
 
+                        assert(kev.data <= kBufSize);
+                        buffer->numBytesInBuffer = kev.data;
+                        buffer->hasData = true;
                         // Read the response from the server.
                         memset(buffer->data, 0, kBufSize);
-                        if (read(connfd, buffer->data, kBufSize) < 0)
+                        if (read(connfd, buffer->data,
+                                 buffer->numBytesInBuffer) < 0) {
                             diep("read()");
-
-                        buffer->hasData = true;
+                        }
                     } break;
                     case KernelEventListener::EventType::kWrite: {
                         // std::cout << "can WRITE" << kev.filter << std::endl;
@@ -129,9 +106,13 @@ void runServer(KernelEventListener& listener) {
                             // std::cout << "is WRITE" << kev.filter <<
                             // std::endl;
                             // TODO make sure enough data is available
-                            if (write(connfd, buffer->data, kBufSize) < 0)
+                            assert(kev.data >= buffer->numBytesInBuffer);
+                            if (write(connfd, buffer->data,
+                                      buffer->numBytesInBuffer) < 0) {
                                 diep("write()");
+                            }
                             buffer->hasData = false;
+                            buffer->numBytesInBuffer = 0;
                         }
                     } break;
                 }
@@ -213,14 +194,37 @@ void runClient(KernelEventListener& listener) {
         });
 }
 
+void runClientSingleThreadBM() {
+    auto serverSocket = tcpopen("0.0.0.0", 8000);
+
+    //    auto stdinfd = fileno(stdin);
+
+    const int kBufSize = 1024;
+    char buf[kBufSize];
+    memset(buf, 0, kBufSize);
+    auto counter = 0;
+    if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+    while (counter < 200'000) {
+        const int kBufSize = 1024;
+        char buf[kBufSize];
+
+        memset(buf, 0, kBufSize);
+
+        if (read(serverSocket, buf, kBufSize) < 0) diep("read()");
+        // TODO make sense
+        if (write(serverSocket, buf, kBufSize) < 0) diep("write()");
+        ++counter;
+    }
+}
+
 void runClientBM(KernelEventListener& listener) {
     auto counter = std::make_shared<int>();
-    for (auto j = 0; j < 256; ++j) {
+    for (auto j = 0; j < 128; ++j) {
         auto serverSocket = tcpopen("0.0.0.0", 8000);
 
         //    auto stdinfd = fileno(stdin);
 
-        const int kBufSize = 1024;
+        const int kBufSize = 8;
         char buf[kBufSize];
         memset(buf, 0, kBufSize);
 
@@ -261,10 +265,13 @@ void runClientBM(KernelEventListener& listener) {
                             buffer->hasData = false;
 
                             ++(*counter);
-                            if (*counter % 1000 == 0)
-                                std::cout << "client j... " << j
-                                          << " counter: " << *counter
-                                          << std::endl;
+                            // if (*counter % 1000 == 0)
+                            // std::cout << "client j... " << j
+                            //          << " counter: " << *counter
+                            //          << std::endl;
+                            if (*counter == 200'000) {
+                                exit(0);
+                            }
                         }
                     } break;
                 }
@@ -314,16 +321,36 @@ void testList() {
     std::cout << "\n\n";
 }
 
-void testKernelEventListener(Executor& executor,
-                             KernelEventListener& keventListener, int argc) {
+void testKernelEventListener(int argc) {
     if (argc == 1) {
+        Executor executor;
+        KernelEventListener keventListener(executor);
+        keventListener.run();
+        std::cout << "Run KEL server!" << std::endl;
         runServer(keventListener);
+        executor.run();
     } else if (argc == 2) {
+        std::cout << "Run other server!" << std::endl;
+        serverMain();
+    } else if (argc == 3) {
+        Executor executor;
         std::cout << "Run client!" << std::endl;
+        KernelEventListener keventListener(executor);
+        keventListener.run();
+
         runClient(keventListener);
-    } else if (argc > 2) {
+        executor.run();
+    } else if (argc == 4) {
+        Executor executor;
+        KernelEventListener keventListener(executor);
+        keventListener.run();
+
         std::cout << "Run client bm!" << std::endl;
         runClientBM(keventListener);
+        executor.run();
+    } else if (argc == 5) {
+        std::cout << "Run client single thread bm!" << std::endl;
+        runClientSingleThreadBM();
     }
 }
 
@@ -545,20 +572,14 @@ void testUserInputSubscriptionServiceWithMacros(
 }
 
 int main(int argc, char** argv) {
-    Executor executor;
     // Environment env(executor);
 
     //    UserInputSubscriptionService inputService(executor);
     //    inputService.run();
     //    testUserInputSubscriptionServiceWithMacros(executor, inputService);
 
-    KernelEventListener keventListener(executor);
-    keventListener.run();
-    testKernelEventListener(executor, keventListener, argc);
+    testKernelEventListener(argc);
 
     // testStrandBasic(executor);
     // testStrandAlternative(executor);
-
-    std::cout << "Starting executor" << std::endl;
-    executor.run();
 }
