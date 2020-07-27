@@ -71,25 +71,6 @@ struct Connection {
 //    int _kernelQueue;
 //};
 
-struct Server {
-    const char* host;
-    int port;
-    int listening_socket_fd;
-    int num_current_connections;
-    Connection connections[kMaxConnections];
-};
-
-struct Client {
-    const char* host;
-    int port;
-
-    const char* server_host;
-    int server_port;
-
-    int socket_fd;
-    Connection server_connection;
-};
-
 template <typename Callable>
 class defer {
    public:
